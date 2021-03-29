@@ -4,11 +4,7 @@ members = [
     "embassy",
     "embassy-traits",
     "embassy-nrf",
-    "embassy-stm32",
-    "embassy-stm32f4",
-    "embassy-stm32l0",
     "embassy-nrf-examples",
-    "embassy-stm32f4-examples",
     "embassy-macros",
     "embassy-extras",
 ]
@@ -17,6 +13,9 @@ members = [
 # for all crates in the workspace together, including it would result in
 # incompatible features enabled in embassy.
 exclude = [
+    "embassy-stm32",
+    "embassy-stm32f4",
+    "embassy-stm32f4-examples",
     "embassy-std",
     "embassy-std-examples",
 ]
