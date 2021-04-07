@@ -10,10 +10,10 @@ use embassy_std::Executor;
 
 use channel::{consts, Channel};
 use device::{Actor, ActorState, Address};
-use embassy_actor_macros::ActorProcessor;
+use embassy_actor_macros::ActorProcess;
 use log::*;
 
-#[derive(ActorProcessor)]
+#[derive(ActorProcess)]
 struct MyActor {
     counter: u32,
 }
@@ -65,7 +65,7 @@ fn main() {
             let a = A1.put(ActorState::new(MyActor::new()));
             let a_addr = a.mount();
             a_addr.send(SayHello).await;
-            spawner.spawn(handle_myactor(a));
+            spawner.spawn(actor_myactor(a));
             spawner.spawn(pinger(a_addr)).unwrap();
         }
 
