@@ -11,25 +11,22 @@ use device::{Actor, ActorState, Address, Device};
 use embassy_actor_macros::{self as drogue, ActorProcess};
 use log::*;
 
-#[derive(ActorProcess)]
 struct MyActor {
     counter: u32,
 }
-pub struct SayHello;
 
 impl MyActor {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { counter: 0 }
-    }
-
-    async fn process(&mut self, request: SayHello) {
-        log::info!("Hello: {}", self.counter);
-        self.counter += 1;
     }
 }
 
-impl Actor for MyActor {
-    type Message = SayHello;
+struct SayHello;
+
+#[drogue::actor]
+async fn process(state: &mut MyActor, request: SayHello) {
+    log::info!("Hello: {}", state.counter);
+    state.counter += 1;
 }
 
 // TODO: Generate scaffold
@@ -45,7 +42,7 @@ async fn main(device: Device) {
     // TODO: Generate scaffold
     let a = A1.put(ActorState::new(MyActor::new()));
     let a_addr = a.mount();
-    device.start(actor_myactor(a));
+    device.start(__DROGUE_process_HANDLER(a));
     loop {
         Timer::after(Duration::from_secs(1)).await;
         a_addr.send(SayHello).await;
