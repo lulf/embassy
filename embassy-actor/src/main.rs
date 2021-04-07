@@ -10,15 +10,23 @@ use embassy_std::Executor;
 
 use channel::{consts, Channel};
 use device::{Actor, ActorState, Address};
+use embassy_actor_macros::ActorProcessor;
 use log::*;
 
+#[derive(ActorProcessor)]
 struct MyActor {
     counter: u32,
 }
+pub struct SayHello;
 
 impl MyActor {
     fn new() -> Self {
         Self { counter: 0 }
+    }
+
+    async fn process(&mut self, request: SayHello) {
+        log::info!("Hello: {}", self.counter);
+        self.counter += 1;
     }
 }
 
@@ -26,26 +34,8 @@ impl Actor for MyActor {
     type Message = SayHello;
 }
 
-pub struct SayHello;
-
 // TODO: Generate scaffold
 static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
-
-async fn process_myactor(state: &mut MyActor, request: SayHello) {
-    log::info!("Hello: {}", state.counter);
-    state.counter += 1;
-}
-
-#[embassy::task]
-async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
-    let channel = &state.channel;
-    let mut actor = state.actor.borrow_mut();
-    loop {
-        log::info!("Awaiting request");
-        let request = channel.receive().await;
-        process_myactor(&mut actor, request).await;
-    }
-}
 
 // System level stuff
 static EXECUTOR: Forever<Executor> = Forever::new();

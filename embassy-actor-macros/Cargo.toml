@@ -1,0 +1,14 @@
+[package]
+authors = ["Ulf Lilleengen <ulf.lilleengen@gmail.com>"]
+edition = "2018"
+name = "embassy-actor-macros"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+
+[workspace]
+
+[dependencies]
+syn = "1.0"
+quote = "1.0"
