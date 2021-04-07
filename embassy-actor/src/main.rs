@@ -31,6 +31,11 @@ pub struct SayHello;
 // TODO: Generate scaffold
 static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
 
+async fn process_myactor(state: &mut MyActor, request: SayHello) {
+    log::info!("Hello: {}", state.counter);
+    state.counter += 1;
+}
+
 #[embassy::task]
 async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
     let channel = &state.channel;
@@ -38,8 +43,7 @@ async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
     loop {
         log::info!("Awaiting request");
         let request = channel.receive().await;
-        log::info!("Hello: {}", actor.counter);
-        actor.counter += 1;
+        process_myactor(&mut actor, request).await;
     }
 }
 
