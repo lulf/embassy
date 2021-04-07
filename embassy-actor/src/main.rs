@@ -3,14 +3,12 @@
 #![feature(type_alias_impl_trait)]
 
 use embassy;
-use embassy::executor::Spawner;
 use embassy::time::{Duration, Timer};
-use embassy::util::{AtomicWaker, Forever};
-use embassy_std::Executor;
+use embassy::util::Forever;
 
 use channel::{consts, Channel};
-use device::{Actor, ActorState, Address};
-use embassy_actor_macros::ActorProcess;
+use device::{Actor, ActorState, Address, Device};
+use embassy_actor_macros::{self as drogue, ActorProcess};
 use log::*;
 
 #[derive(ActorProcess)]
@@ -37,45 +35,62 @@ impl Actor for MyActor {
 // TODO: Generate scaffold
 static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
 
-// System level stuff
-static EXECUTOR: Forever<Executor> = Forever::new();
-
-// #[drogue::main]
-fn main() {
+#[drogue::main]
+async fn main(device: Device) {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_nanos()
         .init();
 
-    // Example
-    #[embassy::task]
-    async fn pinger(address: Address<'static, MyActor>) {
-        loop {
-            Timer::after(Duration::from_secs(1)).await;
-            address.send(SayHello).await;
-        }
-    }
-
-    let mut executor = EXECUTOR.put(Executor::new());
-
     // TODO: Generate scaffold
-    executor.run(|spawner| {
-        #[embassy::task]
-        async fn __actor_main(spawner: Spawner) {
-            let a = A1.put(ActorState::new(MyActor::new()));
-            let a_addr = a.mount();
-            a_addr.send(SayHello).await;
-            spawner.spawn(actor_myactor(a));
-            spawner.spawn(pinger(a_addr)).unwrap();
-        }
-
-        spawner.spawn(__actor_main(spawner)).unwrap();
-    })
+    let a = A1.put(ActorState::new(MyActor::new()));
+    let a_addr = a.mount();
+    device.start(actor_myactor(a));
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+        a_addr.send(SayHello).await;
+    }
 }
+
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+// FRAMEWORK
+// FRAMEWORK
+// FRAMEWORK
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
 
 mod device {
     use crate::channel::{consts, Channel};
     use core::cell::RefCell;
+    use embassy::executor::{SpawnToken, Spawner};
+
+    pub struct Device {
+        spawner: RefCell<Option<Spawner>>,
+    }
+
+    impl Device {
+        pub fn new() -> Self {
+            Self {
+                spawner: RefCell::new(None),
+            }
+        }
+
+        pub fn set_spawner(&self, spawner: Spawner) {
+            self.spawner.borrow_mut().replace(spawner);
+        }
+
+        pub fn start<F>(&self, token: SpawnToken<F>) {
+            self.spawner
+                .borrow_mut()
+                .as_ref()
+                .unwrap()
+                .spawn(token)
+                .unwrap();
+        }
+    }
 
     pub struct ActorState<'a, A: Actor> {
         pub actor: RefCell<A>,
