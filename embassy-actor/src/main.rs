@@ -9,7 +9,7 @@ use embassy::util::{AtomicWaker, Forever};
 use embassy_std::Executor;
 
 use channel::{consts, Channel};
-use device::{Actor, ActorState, Address, Device};
+use device::{Actor, ActorState, Address};
 use log::*;
 
 struct MyActor {
@@ -24,14 +24,9 @@ impl MyActor {
 
 impl Actor for MyActor {
     type Message = SayHello;
-    fn handle(&mut self, channel: &Channel<'static, Self::Message, consts::U4>) {
-        log::info!("Handle called!");
-    }
 }
 
 pub struct SayHello;
-
-// #[drogue::actor]
 
 #[embassy::task]
 async fn handle_myactor(
@@ -46,17 +41,8 @@ async fn handle_myactor(
     }
 }
 
-/*
-#[embassy::task]
-async fn handle_myactor(actor: &'static mut ActorState<'static, MyActor>) {
-    log::info!("Handle: myactor");
-}
-*/
-
 static EXECUTOR: Forever<Executor> = Forever::new();
-static DEVICE: Forever<Device> = Forever::new();
 static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
-static A2: Forever<ActorState<'static, MyActor>> = Forever::new();
 
 // #[drogue::main]
 fn main() {
@@ -66,30 +52,18 @@ fn main() {
         .init();
 
     let mut executor = EXECUTOR.put(Executor::new());
-    let mut device = DEVICE.put(Device::new());
 
-    //   static a2 = A2.put(ActorState::new(MyActor::new()));
-
-    //    let a1addr = device.register(a1);
-
-    //device.mount(&mut a1, handle_foo());
-    //    let a2addr = device.mount(&mut a2, handle_hello);
-
-    //a1addr.send(SayHello);
-    //   a2addr.send(SayHello);
     executor.run(|spawner| {
         #[embassy::task]
         async fn __actor_main(spawner: Spawner) {
             let a = A1.put(ActorState::new(MyActor::new()));
-            a.channel.initialize();
-            let a1addr = a.address();
-            a1addr.send(SayHello).await;
+            let a_addr = a.mount();
+            a_addr.send(SayHello).await;
             spawner.spawn(handle_myactor(&a.actor, &a.channel));
         }
 
         spawner.spawn(__actor_main(spawner)).unwrap();
     })
-    //   device.run(executor);
 }
 
 mod device {
@@ -97,10 +71,6 @@ mod device {
     use embassy::executor::{SpawnToken, Spawner};
     use embassy_std::Executor;
     use heapless::{consts, Vec};
-
-    pub struct Device<'a> {
-        actors: Vec<&'a dyn RegisteredActor, consts::U8>,
-    }
 
     pub struct ActorState<'a, A: Actor> {
         pub actor: A,
@@ -113,49 +83,14 @@ mod device {
             Self { actor, channel }
         }
 
-        pub fn address(&'a self) -> Address<'a, A> {
+        pub fn mount(&'a self) -> Address<'a, A> {
+            self.channel.initialize();
             Address::new(&self.channel)
-        }
-
-        #[embassy::task]
-        async fn handle() {
-            //            state.actor.handle(&state.channel);
-            log::info!("State async fn runnign!");
-        }
-    }
-
-    trait RegisteredActor {
-        fn spawn(&self, spawner: Spawner);
-    }
-
-    impl<'a, A: Actor> RegisteredActor for ActorState<'a, A> {
-        fn spawn(&self, spawner: Spawner) {
-            spawner.spawn(Self::handle());
-        }
-    }
-
-    impl<'a> Device<'a> {
-        pub fn new() -> Self {
-            Self { actors: Vec::new() }
-        }
-
-        pub fn register<A: Actor>(&mut self, actor: &'a ActorState<A>) {
-            let channel = &actor.channel;
-            self.actors.push(actor);
-        }
-
-        pub fn run(&'a self, executor: &'static mut Executor) -> ! {
-            executor.run(|spawner| {
-                for a in self.actors.iter() {
-                    a.spawn(spawner);
-                }
-            })
         }
     }
 
     pub trait Actor {
         type Message;
-        fn handle(&mut self, channel: &Channel<'static, Self::Message, consts::U4>);
     }
 
     pub struct Address<'a, A: Actor> {
