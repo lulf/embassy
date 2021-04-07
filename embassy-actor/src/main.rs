@@ -46,21 +46,21 @@ async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
 // System level stuff
 static EXECUTOR: Forever<Executor> = Forever::new();
 
-// Example
-#[embassy::task]
-async fn pinger(address: Address<'static, MyActor>) {
-    loop {
-        Timer::after(Duration::from_secs(1)).await;
-        address.send(SayHello).await;
-    }
-}
-
 // #[drogue::main]
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_nanos()
         .init();
+
+    // Example
+    #[embassy::task]
+    async fn pinger(address: Address<'static, MyActor>) {
+        loop {
+            Timer::after(Duration::from_secs(1)).await;
+            address.send(SayHello).await;
+        }
+    }
 
     let mut executor = EXECUTOR.put(Executor::new());
 
