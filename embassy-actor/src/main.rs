@@ -28,16 +28,16 @@ impl Actor for MyActor {
 
 pub struct SayHello;
 
+// TODO: Generate scaffold
 #[embassy::task]
-async fn handle_myactor(
-    actor: &'static MyActor,
-    channel: &'static Channel<'static, SayHello, consts::U4>,
-) {
-    log::info!("Initializing");
+async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
+    let channel = &state.channel;
+    let mut actor = state.actor.borrow_mut();
     loop {
         log::info!("Awaiting request");
         let request = channel.receive().await;
         log::info!("Hello: {}", actor.counter);
+        actor.counter += 1;
     }
 }
 
@@ -53,13 +53,14 @@ fn main() {
 
     let mut executor = EXECUTOR.put(Executor::new());
 
+    // TODO: Generate scaffold
     executor.run(|spawner| {
         #[embassy::task]
         async fn __actor_main(spawner: Spawner) {
             let a = A1.put(ActorState::new(MyActor::new()));
             let a_addr = a.mount();
             a_addr.send(SayHello).await;
-            spawner.spawn(handle_myactor(&a.actor, &a.channel));
+            spawner.spawn(handle_myactor(a));
         }
 
         spawner.spawn(__actor_main(spawner)).unwrap();
@@ -67,20 +68,21 @@ fn main() {
 }
 
 mod device {
-    use crate::channel::Channel;
-    use embassy::executor::{SpawnToken, Spawner};
-    use embassy_std::Executor;
-    use heapless::{consts, Vec};
+    use crate::channel::{consts, Channel};
+    use core::cell::RefCell;
 
     pub struct ActorState<'a, A: Actor> {
-        pub actor: A,
+        pub actor: RefCell<A>,
         pub channel: Channel<'a, A::Message, consts::U4>,
     }
 
     impl<'a, A: Actor> ActorState<'a, A> {
         pub fn new(actor: A) -> Self {
             let mut channel: Channel<'a, A::Message, consts::U4> = Channel::new();
-            Self { actor, channel }
+            Self {
+                actor: RefCell::new(actor),
+                channel,
+            }
         }
 
         pub fn mount(&'a self) -> Address<'a, A> {
