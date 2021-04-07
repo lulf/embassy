@@ -29,6 +29,8 @@ impl Actor for MyActor {
 pub struct SayHello;
 
 // TODO: Generate scaffold
+static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
+
 #[embassy::task]
 async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
     let channel = &state.channel;
@@ -41,8 +43,17 @@ async fn handle_myactor(state: &'static ActorState<'static, MyActor>) {
     }
 }
 
+// System level stuff
 static EXECUTOR: Forever<Executor> = Forever::new();
-static A1: Forever<ActorState<'static, MyActor>> = Forever::new();
+
+// Example
+#[embassy::task]
+async fn pinger(address: Address<'static, MyActor>) {
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+        address.send(SayHello).await;
+    }
+}
 
 // #[drogue::main]
 fn main() {
@@ -61,6 +72,7 @@ fn main() {
             let a_addr = a.mount();
             a_addr.send(SayHello).await;
             spawner.spawn(handle_myactor(a));
+            spawner.spawn(pinger(a_addr)).unwrap();
         }
 
         spawner.spawn(__actor_main(spawner)).unwrap();
