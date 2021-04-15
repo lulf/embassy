@@ -43,15 +43,23 @@ pub fn generate(args: &Args) -> TokenStream {
     }
 
     quote!(
-        use #embassy_stm32_path::{rtc, interrupt, Peripherals, pac, hal::rcc::RccExt, hal::time::U32Ext};
+        use #embassy_stm32_path::{rtc, interrupt, Peripherals, pac, hal, hal::rcc::{Config, RccExt}, hal::time::U32Ext};
 
         let dp = pac::Peripherals::take().unwrap();
-        let rcc = dp.RCC.constrain();
-        let clocks = rcc.cfgr#clock_cfg_args.freeze();
+        /*
+        #[cfg(not(feature = "chip+stm32l0x2", feature = "stm32l0x2"))]
+        let clocks = {
+            let rcc = dp.RCC.constrain();
+            rcc.cfgr#clock_cfg_args.freeze()
+        };*/
+
+        //#[cfg(any(feature = "chip+stm32l0x2", feature = "stm32l0x2"))]
+        let mut rcc = dp.RCC.freeze(Config::hsi16());
+        let clocks = rcc.clocks;
 
         unsafe { Peripherals::set_peripherals(clocks) };
 
-        let mut rtc = rtc::RTC::new(dp.TIM3, interrupt::take!(TIM3), clocks);
+        let mut rtc = rtc::RTC::new(dp.TIM2, interrupt::take!(TIM2), clocks);
         let rtc = unsafe { make_static(&mut rtc) };
         rtc.start();
         let mut alarm = rtc.alarm1();

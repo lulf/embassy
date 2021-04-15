@@ -1,8 +1,8 @@
-use crate::hal::bb;
+use crate::bb;
 use crate::hal::rcc::Clocks;
+use atomic_polyfill::{compiler_fence, AtomicU32, Ordering};
 use core::cell::Cell;
 use core::convert::TryInto;
-use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
 use embassy::interrupt::InterruptExt;
 use embassy::time::{Clock, TICKS_PER_SECOND};
@@ -180,7 +180,7 @@ impl<T: Instance> RTC<T> {
             } else {
                 self.rtc.set_compare_interrupt(n, false);
             }
-        })
+        });
     }
 
     pub fn alarm1(&'static self) -> Alarm<T> {
@@ -272,9 +272,12 @@ macro_rules! impl_timer {
                     unsafe {
                         let rcc = &*RCC::ptr();
 
-                        bb::set(&rcc.$apbenr, $enrbit);
-                        bb::set(&rcc.$apbrstr, $rstrbit);
-                        bb::clear(&rcc.$apbrstr, $rstrbit);
+                        rcc.$apbenr.modify(|_, w| w.tim2en().set_bit());
+                        rcc.$apbrstr.modify(|_, w| w.tim2rst().set_bit());
+                        rcc.$apbrstr.modify(|_, w| w.tim2rst().clear_bit());
+                        //bb::set(&rcc.$apbenr, $enrbit);
+                        //bb::set(&rcc.$apbrstr, $rstrbit);
+                        //bb::clear(&rcc.$apbrstr, $rstrbit);
                     }
                 }
 
@@ -296,9 +299,12 @@ macro_rules! impl_timer {
                     let bit = n as u8 + 1;
                     unsafe {
                         if enable {
-                            bb::set(&self.dier, bit);
+                            //self.dier.modify(|w| w.cc1ie().set_bit());
+                            self.dier.modify(|r, w| w.bits(r.bits() | (1 << bit)));
+                            // bb::set(&self.dier, bit);
                         } else {
-                            bb::clear(&self.dier, bit);
+                            self.dier.modify(|r, w| w.bits(r.bits() & !(1 << bit)));
+                            //bb::clear(&self.dier, bit);
                         }
                     }
                 }
@@ -320,7 +326,8 @@ macro_rules! impl_timer {
                     }
                     let bit = n as u8 + 1;
                     unsafe {
-                        bb::clear(&self.sr, bit);
+                        // bb::clear(&self.sr, bit);
+                        self.sr.modify(|r, w| w.bits(r.bits() & !(1 << bit)));
                     }
                 }
 
@@ -330,7 +337,8 @@ macro_rules! impl_timer {
 
                 fn overflow_clear_flag(&self) {
                     unsafe {
-                        bb::clear(&self.sr, 0);
+                        // bb::clear(&self.sr, 0);
+                        self.sr.modify(|_, w| w.uif().clear_bit());
                     }
                 }
 
@@ -341,21 +349,21 @@ macro_rules! impl_timer {
 
                     unsafe {
                         // Set URS, generate update, clear URS
-                        bb::set(&self.cr1, 2);
+                        self.cr1.modify(|_, w| w.urs().set_bit());
                         self.egr.write(|w| w.ug().set_bit());
-                        bb::clear(&self.cr1, 2);
+                        self.cr1.modify(|_, w| w.urs().clear_bit());
                     }
                 }
 
                 fn stop_and_reset(&self) {
                     unsafe {
-                        bb::clear(&self.cr1, 0);
+                        self.cr1.modify(|_, w| w.cen().clear_bit());
                     }
                     self.cnt.reset();
                 }
 
                 fn start(&self) {
-                    unsafe { bb::set(&self.cr1, 0) }
+                    self.cr1.modify(|_, w| w.cen().set_bit());
                 }
 
                 fn counter(&self) -> u16 {
@@ -487,18 +495,51 @@ macro_rules! impl_timer {
     };
 }
 
-#[cfg(not(feature = "stm32f410"))]
-impl_timer!(tim2: (TIM2, TIM2, apb1enr, 0, apb1rstr, 0, ppre1, pclk1), 3);
+#[cfg(any(
+    feature = "stm32f401",
+    feature = "stm32f405",
+    feature = "stm32f407",
+    feature = "stm32f412",
+    feature = "stm32f413",
+    feature = "stm32f415",
+    feature = "stm32f417",
+    feature = "stm32f423",
+    feature = "stm32f427",
+    feature = "stm32f429",
+    feature = "stm32f437",
+    feature = "stm32f439",
+    feature = "stm32f446",
+    feature = "stm32f469",
+    feature = "stm32f479",
+))]
+mod timers {
+    use super::*;
 
-#[cfg(not(feature = "stm32f410"))]
-impl_timer!(tim3: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
+    #[cfg(not(feature = "stm32f410"))]
+    impl_timer!(tim2: (TIM2, TIM2, apb1enr, 0, apb1rstr, 0, ppre1, pclk1), 3);
 
-#[cfg(not(feature = "stm32f410"))]
-impl_timer!(tim4: (TIM4, TIM4, apb1enr, 2, apb1rstr, 2, ppre1, pclk1), 3);
+    #[cfg(not(feature = "stm32f410"))]
+    impl_timer!(tim3: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
 
-impl_timer!(tim5: (TIM5, TIM5, apb1enr, 3, apb1rstr, 3, ppre1, pclk1), 3);
+    #[cfg(not(feature = "stm32f410"))]
+    impl_timer!(tim4: (TIM4, TIM4, apb1enr, 2, apb1rstr, 2, ppre1, pclk1), 3);
 
-impl_timer!(tim9: (TIM9, TIM1_BRK_TIM9, apb2enr, 16, apb2rstr, 16, ppre2, pclk2), 1);
+    impl_timer!(tim5: (TIM5, TIM5, apb1enr, 3, apb1rstr, 3, ppre1, pclk1), 3);
 
-#[cfg(not(any(feature = "stm32f401", feature = "stm32f410", feature = "stm32f411")))]
-impl_timer!(tim12: (TIM12, TIM8_BRK_TIM12, apb1enr, 6, apb1rstr, 6, ppre1, pclk1), 1);
+    impl_timer!(tim9: (TIM9, TIM1_BRK_TIM9, apb2enr, 16, apb2rstr, 16, ppre2, pclk2), 1);
+
+    #[cfg(not(any(feature = "stm32f401", feature = "stm32f410", feature = "stm32f411")))]
+    impl_timer!(tim12: (TIM12, TIM8_BRK_TIM12, apb1enr, 6, apb1rstr, 6, ppre1, pclk1), 1);
+}
+
+#[cfg(any(feature = "stm32l0x1", feature = "stm32l0x2", feature = "stm32l0x3",))]
+mod timers {
+    use super::*;
+
+    impl_timer!(tim2: (TIM2, TIM2, apb1enr, 0, apb1rstr, 0, apb1_pre, apb1_clk), 3);
+    impl_timer!(tim3: (TIM3, TIM3, apb1enr, 0, apb1rstr, 0, apb1_pre, apb1_clk), 3);
+    //    impl_timer!(tim3: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
+    //    impl_timer!(tim6: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
+    //    impl_timer!(tim21: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
+    //    impl_timer!(tim22: (TIM3, TIM3, apb1enr, 1, apb1rstr, 1, ppre1, pclk1), 3);
+}
