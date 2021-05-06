@@ -112,6 +112,7 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
             use #embassy_path::executor::raw::Task;
             #task_fn
             type F = #impl_ty;
+
             const NEW_TASK: Task<F> = Task::new();
             static POOL: [Task<F>; #pool_size] = [NEW_TASK; #pool_size];
             unsafe { Task::spawn_pool(&POOL, move || task(#arg_names)) }
