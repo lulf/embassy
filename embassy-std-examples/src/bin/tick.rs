@@ -3,31 +3,16 @@
 #![feature(type_alias_impl_trait)]
 #![feature(generic_associated_types)]
 
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use embassy::executor::{raw::Task, SpawnToken, Spawner};
 use embassy::time::{Duration, Timer};
 use embassy::util::Forever;
 use embassy_std::Executor;
 use log::*;
-
-struct RunnableFuture {
-    actor: &'static mut dyn Runnable,
-}
-
-impl Future for RunnableFuture {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.actor.poll(cx)
-    }
-}
-
-trait Runnable {
-    fn run(&'static mut self) -> RunnableFuture;
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()>;
-    fn spawn(&'static mut self, spawner: Spawner);
-}
 
 trait A {
     type StartFuture<'m>: Future<Output = ()> + 'm
@@ -59,83 +44,72 @@ impl A for C {
 }
 
 enum ActorState<'a, T: A + 'a> {
+    New,
     Start(T::StartFuture<'a>),
     Process,
     Event(T::EventFuture<'a>),
 }
 
-struct B<'a, T: A + 'a> {
-    task: Task<impl Future + 'a>,
-    state: Option<ActorState<'a, T>>,
-    counter: u32,
-    t: T,
+struct RunFuture<'a, T: A + Unpin + 'static> {
+    context: &'a B<'a, T>,
 }
 
-impl<'a, T: A + Unpin> B<'a, T> {
-    pub fn initialize(&'a mut self) {
-        let fut = self.t.do_start();
-        self.state.replace(ActorState::Start(fut)); //unsafe { core::mem::transmute_copy(&fut) });
+impl<'a, T: A + Unpin + 'a> Future for RunFuture<'a, T> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.context.poll(cx)
     }
 }
 
-impl<'a, T: A + Unpin> Runnable for B<'a, T> {
-    fn run(&'static mut self) -> RunnableFuture {
-        RunnableFuture { actor: self }
+struct B<'a, T: A + Unpin + 'static> {
+    task: Task<RunFuture<'static, T>>,
+    t: UnsafeCell<T>,
+    state: Cell<ActorState<'a, T>>,
+    counter: AtomicU32,
+}
+
+impl<'a, T: A + Unpin + 'static> B<'a, T> {
+    fn mount(&'static mut self, spawner: Spawner) {
+        let task = &self.task;
+        let future = RunFuture { context: self };
+        let token = Task::spawn(task, move || future);
+        spawner.spawn(token).unwrap();
     }
 
-    fn spawn(&'static mut self, spawner: Spawner) {
-
-        /*
-        -> SpawnToken<impl Future + 'static> {
-                    type T = impl Future + 'static;
-                    static TASK: Task<T> = Task::new();
-                    Task::spawn(&TASK, move || async move {
-                        runnable.run().await;
-                    })
-                }
-                */
-    }
-
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut counter = 0;
+    fn poll(&'a self, cx: &mut Context<'_>) -> Poll<()> {
         loop {
-            match self.state.take().unwrap() {
+            match self.state.replace(ActorState::New) {
+                ActorState::New => {
+                    let fut = unsafe { &mut *self.t.get() }.do_start();
+                    self.state.set(ActorState::Start(fut));
+                }
                 ActorState::Start(mut fut) => {
                     let r = unsafe { Pin::new_unchecked(&mut fut) }.poll(cx);
                     if r.is_pending() {
-                        self.state.replace(ActorState::Start(fut));
+                        self.state.set(ActorState::Start(fut));
                         return Poll::Pending;
                     } else {
-                        self.state.replace(ActorState::Process);
+                        self.state.set(ActorState::Process);
                     }
                 }
                 ActorState::Process => {
-                    let event = self.counter;
-                    self.counter += 1;
+                    let event = self.counter.fetch_add(1, Ordering::SeqCst);
 
-                    let fut = self.t.do_event(event);
-                    self.state.replace(ActorState::Event(fut));
+                    let fut = unsafe { &mut *self.t.get() }.do_event(event);
+                    self.state.set(ActorState::Event(fut));
                 }
                 ActorState::Event(mut fut) => {
                     let r = unsafe { Pin::new_unchecked(&mut fut) }.poll(cx);
                     if r.is_pending() {
-                        self.state.replace(ActorState::Event(fut));
+                        self.state.set(ActorState::Event(fut));
                         return Poll::Pending;
                     } else {
-                        self.state.replace(ActorState::Process);
+                        self.state.set(ActorState::Process);
                     }
                 }
             }
         }
     }
-}
-
-fn run(runnable: &'static mut dyn Runnable) -> SpawnToken<impl Future + 'static> {
-    type T = impl Future + 'static;
-    static TASK: Task<T> = Task::new();
-    Task::spawn(&TASK, move || async move {
-        runnable.run().await;
-    })
 }
 
 static EXECUTOR: Forever<Executor> = Forever::new();
@@ -148,22 +122,19 @@ fn main() {
 
     static mut R: B<C> = B {
         task: Task::new(),
-        t: C {},
-        state: None,
-        counter: 0,
+        t: UnsafeCell::new(C {}),
+        state: Cell::new(ActorState::New),
+        counter: AtomicU32::new(0),
     };
-    unsafe { R.initialize() };
-
     static mut U: B<C> = B {
         task: Task::new(),
-        t: C {},
-        state: None,
-        counter: 10,
+        t: UnsafeCell::new(C {}),
+        state: Cell::new(ActorState::New),
+        counter: AtomicU32::new(10),
     };
-    unsafe { U.initialize() };
     let executor = EXECUTOR.put(Executor::new());
     executor.run(|spawner| {
-        spawner.spawn(run(unsafe { &mut R })).unwrap();
-        spawner.spawn(run(unsafe { &mut U })).unwrap();
+        unsafe { R.mount(spawner) };
+        unsafe { U.mount(spawner) };
     });
 }
