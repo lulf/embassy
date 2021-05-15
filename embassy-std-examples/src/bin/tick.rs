@@ -69,7 +69,7 @@ struct B<'a, T: A + 'a> {
 }
 
 impl<'a, T: A + 'a> B<'a, T> {
-    fn mount(&'a self, spawner: Spawner) {
+    fn mount(&'static self, spawner: Spawner) {
         let task = &self.task;
         let future = RunFuture { context: self };
         let token = Task::spawn(task, move || future);
