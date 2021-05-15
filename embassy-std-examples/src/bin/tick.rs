@@ -50,7 +50,7 @@ enum ActorState<'a, T: A + 'a> {
     Event(T::EventFuture<'a>),
 }
 
-struct RunFuture<'a, T: A + 'static> {
+struct RunFuture<'a, T: A + 'a> {
     context: &'a B<'a, T>,
 }
 
@@ -61,15 +61,15 @@ impl<'a, T: A + 'a> Future for RunFuture<'a, T> {
     }
 }
 
-struct B<'a, T: A + 'static> {
-    task: Task<RunFuture<'static, T>>,
+struct B<'a, T: A + 'a> {
+    task: Task<RunFuture<'a, T>>,
     t: UnsafeCell<T>,
     state: Cell<ActorState<'a, T>>,
     counter: AtomicU32,
 }
 
-impl<'a, T: A + 'static> B<'a, T> {
-    fn mount(&'static self, spawner: Spawner) {
+impl<'a, T: A + 'a> B<'a, T> {
+    fn mount(&'a self, spawner: Spawner) {
         let task = &self.task;
         let future = RunFuture { context: self };
         let token = Task::spawn(task, move || future);
