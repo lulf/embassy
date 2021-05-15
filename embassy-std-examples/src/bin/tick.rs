@@ -50,25 +50,25 @@ enum ActorState<'a, T: A + 'a> {
     Event(T::EventFuture<'a>),
 }
 
-struct RunFuture<'a, T: A + Unpin + 'static> {
+struct RunFuture<'a, T: A + 'static> {
     context: &'a B<'a, T>,
 }
 
-impl<'a, T: A + Unpin + 'a> Future for RunFuture<'a, T> {
+impl<'a, T: A + 'a> Future for RunFuture<'a, T> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.context.poll(cx)
     }
 }
 
-struct B<'a, T: A + Unpin + 'static> {
+struct B<'a, T: A + 'static> {
     task: Task<RunFuture<'static, T>>,
     t: UnsafeCell<T>,
     state: Cell<ActorState<'a, T>>,
     counter: AtomicU32,
 }
 
-impl<'a, T: A + Unpin + 'static> B<'a, T> {
+impl<'a, T: A + 'static> B<'a, T> {
     fn mount(&'static mut self, spawner: Spawner) {
         let task = &self.task;
         let future = RunFuture { context: self };
