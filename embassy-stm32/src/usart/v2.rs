@@ -264,97 +264,99 @@ impl<'d, T: Instance> BufferedUart<'d, T> {
     }
 }
 
-impl<'d, T: Instance> PeripheralState for StateInner<'d, T>
+impl<'d, T: Instance> StateInner<'d, T>
 where
     Self: 'd,
 {
-    type Interrupt = T::Interrupt;
-    fn on_interrupt(&mut self) {
-        let r = self.inner.regs();
-        loop {
-            match self.rx_state {
-                RxState::Idle => {
-                    //info!("  irq_rx: in state idle");
+    fn start_read(&mut self) {
+        let buf = self.rx.push_buf();
+        if !buf.is_empty() {
+            // trace!("  irq_rx: starting {:?}", buf.len());
+            self.rx_state = RxState::Receiving(0, buf);
+        }
+    }
 
-                    let buf = self.rx.push_buf();
-                    if !buf.is_empty() {
-                        // trace!("  irq_rx: starting {:?}", buf.len());
-                        self.rx_state = RxState::Receiving(0, buf);
+    fn read_until_idle(&mut self, mut offset: usize, buf: *mut [u8]) -> Result<usize, Error> {
+        let r = self.inner.regs();
+        unsafe {
+            let bufs = &mut *buf;
+            loop {
+                let sr = r.isr().read();
+                if sr.pe() {
+                    r.icr().write(|w| {
+                        w.set_pe(true);
+                    });
+                    return Err(Error::Parity);
+                } else if sr.fe() {
+                    r.icr().write(|w| {
+                        w.set_fe(true);
+                    });
+                    return Err(Error::Framing);
+                } else if sr.nf() {
+                    r.icr().write(|w| {
+                        w.set_nf(true);
+                    });
+                    return Err(Error::Noise);
+                } else if sr.ore() {
+                    r.icr().write(|w| {
+                        w.set_ore(true);
+                    });
+                    return Err(Error::Overrun);
+                } else if sr.rxne() {
+                    let b = r.rdr().read().0 as u8;
+                    //info!("RX {}", b);
+                    bufs[offset] = b;
+                    offset += 1;
+                    if offset == bufs.len() {
+                        //info!("RX of {} bytes done: {}", read, b);
+                        self.rx.push(offset);
+                        self.rx_waker.wake();
+                        self.rx_state = RxState::Idle;
+                        self.start_read();
+                        break;
+                    } else {
+                        self.rx_state = RxState::Receiving(offset, buf);
+                    }
+                } else if sr.idle() {
+                    //info!("idle line detected, read {}", read);
+                    r.icr().write(|w| {
+                        w.set_idle(true);
+                    });
+                    // Restart request with new buffer if we got data before idle
+                    if offset > 0 {
+                        self.rx.push(offset);
+                        self.rx_waker.wake();
+                        self.rx_state = RxState::Idle;
+                        self.start_read();
+                    } else {
+                        self.rx_state = RxState::Receiving(offset, buf);
+                        return Ok(0);
                     }
                     break;
-                }
-                RxState::Receiving(mut read, buf) => {
-                    let mut done = false;
-                    unsafe {
-                        let bufs = &mut *buf;
-                        loop {
-                            let sr = r.isr().read();
-                            if sr.pe() {
-                                info!("Parity error");
-                                done = true;
-                                break;
-                            } else if sr.fe() {
-                                r.icr().write(|w| {
-                                    w.set_fe(true);
-                                });
-                                done = true;
-                                break;
-                            } else if sr.nf() {
-                                r.icr().write(|w| {
-                                    w.set_nf(true);
-                                });
-                                //info!("Noise error");
-                                done = true;
-                                break;
-                            } else if sr.ore() {
-                                r.icr().write(|w| {
-                                    w.set_ore(true);
-                                });
-                                //info!("overrun error");
-                                done = true;
-                                break;
-                            } else if sr.rxne() {
-                                let b = r.rdr().read().0 as u8;
-                                //info!("RX {}", b);
-                                bufs[read] = b;
-                                read += 1;
-                                if read == bufs.len() {
-                                    //info!("RX of {} bytes done: {}", read, b);
-                                    self.rx.push(read);
-                                    self.rx_waker.wake();
-                                    self.rx_state = RxState::Idle;
-                                    break;
-                                } else {
-                                    self.rx_state = RxState::Receiving(read, buf);
-                                }
-                            } else if sr.idle() {
-                                //info!("idle line detected, read {}", read);
-                                r.icr().write(|w| {
-                                    w.set_idle(true);
-                                });
-                                // Restart request with new buffer if we got data before idle
-                                if read > 0 {
-                                    self.rx.push(read);
-                                    self.rx_waker.wake();
-                                    self.rx_state = RxState::Idle;
-                                } else {
-                                    self.rx_state = RxState::Receiving(read, buf);
-                                    done = true;
-                                }
-                                break;
-                            } else {
-                                done = true;
-                                break;
-                            }
-                        }
-                    }
-                    if done {
-                        break;
-                    }
+                } else {
+                    return Ok(0);
                 }
             }
         }
+        return Ok(offset);
+    }
 
+    fn on_rx(&mut self) {
+        match self.rx_state {
+            RxState::Idle => {
+                //info!("  irq_rx: in state idle");
+                self.start_read();
+            }
+            RxState::Receiving(mut offset, buf) => match self.read_until_idle(offset, buf) {
+                Ok(0) => {}
+                Ok(n) => {}
+                Err(e) => {}
+            },
+        }
+    }
+
+    fn on_tx(&mut self) {
+        let r = self.inner.regs();
         loop {
             match self.tx_state {
                 TxState::Idle => {
@@ -395,6 +397,17 @@ where
                 }
             }
         }
+    }
+}
+
+impl<'d, T: Instance> PeripheralState for StateInner<'d, T>
+where
+    Self: 'd,
+{
+    type Interrupt = T::Interrupt;
+    fn on_interrupt(&mut self) {
+        self.on_rx();
+        self.on_tx();
     }
 }
 
