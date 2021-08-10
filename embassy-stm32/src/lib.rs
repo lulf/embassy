@@ -3,6 +3,8 @@
 #![feature(asm)]
 #![feature(type_alias_impl_trait)]
 #![allow(incomplete_features)]
+#![feature(min_type_alias_impl_trait)]
+#![feature(const_fn_fn_ptr_basics)]
 
 #[cfg(feature = "unstable-pac")]
 pub use stm32_metapac as pac;
