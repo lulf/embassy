@@ -75,21 +75,24 @@ pub use timeout::Timeout;
 pub use tx_params::{RampTime, TxParams};
 pub use value_error::ValueError;
 
+use crate::interrupt::SUBGHZ_RADIO;
+use embassy::channel::signal::Signal;
+use embassy::interrupt::{Interrupt, InterruptExt};
 use embassy_hal_common::ratio::Ratio;
 
 use crate::{
-    dma::NoDma,
     pac,
     peripherals::SUBGHZSPI,
     rcc::sealed::RccPeripheral,
-    spi::{ByteOrder, Config as SpiConfig, MisoPin, MosiPin, SckPin, Spi},
+    spi::{
+        ByteOrder, Config as SpiConfig, MisoPin, MosiPin, RxDmaChannel, SckPin, Spi, TxDmaChannel,
+        MODE_0,
+    },
     time::Hertz,
 };
+use embassy::traits::spi::*;
 use embassy::util::Unborrow;
-use embedded_hal::{
-    blocking::spi::{Transfer, Write},
-    spi::MODE_0,
-};
+use embassy_hal_common::unborrow;
 
 /// Passthrough for SPI errors (for now)
 pub type Error = crate::spi::Error;
@@ -181,11 +184,20 @@ fn rfbusyms() -> bool {
 */
 
 /// Sub-GHz radio peripheral
-pub struct SubGhz<'d, Tx, Rx> {
+pub struct SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     spi: Spi<'d, SUBGHZSPI, Tx, Rx>,
+    irq: SUBGHZ_RADIO,
 }
 
-impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     fn pulse_radio_reset() {
         let rcc = pac::RCC;
         unsafe {
@@ -194,23 +206,19 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
         }
     }
 
-    // TODO: This should be replaced with async handling based on IRQ
-    fn poll_not_busy(&self) {
-        let mut count: u32 = 1_000_000;
-        while rfbusys() {
-            count -= 1;
-            if count == 0 {
-                let pwr = pac::PWR;
-                unsafe {
-                    panic!(
-                        "rfbusys timeout pwr.sr2=0x{:X} pwr.subghzspicr=0x{:X} pwr.cr1=0x{:X}",
-                        pwr.sr2().read().0,
-                        pwr.subghzspicr().read().0,
-                        pwr.cr1().read().0
-                    );
-                }
-            }
-        }
+    fn wait_until_ready(&mut self) {
+        while rfbusys() {}
+    }
+
+    pub async fn wait_irq(&mut self) -> Result<(Status, u16), Error> {
+        info!("Awaiting irq status...");
+        IRQ.wait().await;
+        info!("IRQ raised, reading current status");
+        let (status, irq_status) = self.irq_status().await?;
+        IRQ.reset();
+        info!("Reenabling IRQ");
+        self.irq.enable();
+        Ok((status, irq_status))
     }
 
     /// Create a new sub-GHz radio driver from a peripheral.
@@ -224,7 +232,9 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
         miso: impl Unborrow<Target = impl MisoPin<SUBGHZSPI>>,
         txdma: impl Unborrow<Target = Tx>,
         rxdma: impl Unborrow<Target = Rx>,
+        irq: impl Unborrow<Target = SUBGHZ_RADIO> + 'd,
     ) -> Self {
+        unborrow!(irq);
         Self::pulse_radio_reset();
 
         // see RM0453 rev 1 section 7.2.13 page 291
@@ -236,9 +246,19 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
         config.byte_order = ByteOrder::MsbFirst;
         let spi = Spi::new(peri, sck, mosi, miso, txdma, rxdma, clk, config);
 
+        irq.disable();
+        irq.set_handler(|_| {
+            // This is safe because we only get interrupts when configured for, so
+            // the radio will be awaiting on the signal at this point. If not, the ISR will
+            // anyway only adjust the state in the IRQ signal state.
+            unsafe { SUBGHZ_RADIO::steal() }.disable();
+            IRQ.signal(());
+        });
+        irq.enable();
+
         unsafe { wakeup() };
 
-        SubGhz { spi }
+        SubGhz { spi, irq }
     }
 
     pub fn is_busy(&mut self) -> bool {
@@ -250,50 +270,59 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
     }
 }
 
-impl<'d> SubGhz<'d, NoDma, NoDma> {
-    fn read(&mut self, opcode: OpCode, data: &mut [u8]) -> Result<(), Error> {
-        self.poll_not_busy();
+static IRQ: Signal<()> = Signal::new();
+
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
+    async fn read(&mut self, opcode: OpCode, data: &mut [u8], write: &[u8]) -> Result<(), Error> {
+        self.wait_until_ready();
         {
+            info!("SPI READ {} bytes", data.len());
             let _nss: Nss = Nss::new();
-            self.spi.write(&[opcode as u8])?;
-            self.spi.transfer(data)?;
+            self.spi.write(&[opcode as u8]).await?;
+            info!("Wrote opcode, doing transfer");
+            self.spi.read_write(data, write).await?;
+            info!("SPI READ DONE");
         }
-        self.poll_not_busy();
+        self.wait_until_ready();
         Ok(())
     }
 
     /// Read one byte from the sub-Ghz radio.
-    fn read_1(&mut self, opcode: OpCode) -> Result<u8, Error> {
+    async fn read_1(&mut self, opcode: OpCode) -> Result<u8, Error> {
         let mut buf: [u8; 1] = [0; 1];
-        self.read(opcode, &mut buf)?;
+        self.read(opcode, &mut buf, &[0]).await?;
         Ok(buf[0])
     }
 
     /// Read a fixed number of bytes from the sub-Ghz radio.
-    fn read_n<const N: usize>(&mut self, opcode: OpCode) -> Result<[u8; N], Error> {
+    async fn read_n<const N: usize>(&mut self, opcode: OpCode) -> Result<[u8; N], Error> {
         let mut buf: [u8; N] = [0; N];
-        self.read(opcode, &mut buf)?;
+        self.read(opcode, &mut buf, &[0; N]).await?;
         Ok(buf)
     }
 
-    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.poll_not_busy();
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.wait_until_ready();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(data)?;
+            self.spi.write(data).await?;
         }
-        self.poll_not_busy();
+        self.wait_until_ready();
         Ok(())
     }
 
-    pub fn write_buffer(&mut self, offset: u8, data: &[u8]) -> Result<(), Error> {
-        self.poll_not_busy();
+    pub async fn write_buffer(&mut self, offset: u8, data: &[u8]) -> Result<(), Error> {
+        self.wait_until_ready();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(&[OpCode::WriteBuffer as u8, offset])?;
-            self.spi.write(data)?;
+            self.spi.write(&[OpCode::WriteBuffer as u8, offset]).await?;
+            self.spi.write(data).await?;
         }
-        self.poll_not_busy();
+        self.wait_until_ready();
 
         Ok(())
     }
@@ -302,17 +331,18 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     ///
     /// The offset and length of a received packet is provided by
     /// [`rx_buffer_status`](Self::rx_buffer_status).
-    pub fn read_buffer(&mut self, offset: u8, buf: &mut [u8]) -> Result<Status, Error> {
+    pub async fn read_buffer(&mut self, offset: u8, buf: &mut [u8]) -> Result<Status, Error> {
         let mut status_buf: [u8; 1] = [0];
 
-        self.poll_not_busy();
+        self.wait_until_ready();
         {
             let _nss: Nss = Nss::new();
-            self.spi.write(&[OpCode::ReadBuffer as u8, offset])?;
-            self.spi.transfer(&mut status_buf)?;
-            self.spi.transfer(buf)?;
+            self.spi.write(&[OpCode::ReadBuffer as u8, offset]).await?;
+            self.spi.read_write(&mut status_buf, &[0]).await?;
+            self.spi.write(buf).await?;
+            self.spi.read(buf).await?;
         }
-        self.poll_not_busy();
+        self.wait_until_ready();
 
         Ok(status_buf[0].into())
     }
@@ -333,39 +363,44 @@ macro_rules! wr_reg {
 
 // 5.8.2
 /// Register access
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     // register write with variable length data
-    fn write_register(&mut self, register: Register, data: &[u8]) -> Result<(), Error> {
+    async fn write_register(&mut self, register: Register, data: &[u8]) -> Result<(), Error> {
         let addr: [u8; 2] = register.address().to_be_bytes();
 
-        self.poll_not_busy();
+        self.wait_until_ready();
         {
             let _nss: Nss = Nss::new();
             self.spi
-                .write(&[OpCode::WriteRegister as u8, addr[0], addr[1]])?;
-            self.spi.write(data)?;
+                .write(&[OpCode::WriteRegister as u8, addr[0], addr[1]])
+                .await?;
+            self.spi.write(data).await?;
         }
-        self.poll_not_busy();
+        self.wait_until_ready();
 
         Ok(())
     }
 
     /// Set the LoRa bit synchronization.
-    pub fn set_bit_sync(&mut self, bs: BitSync) -> Result<(), Error> {
-        self.write(wr_reg![GBSYNC, bs.as_bits()])
+    pub async fn set_bit_sync(&mut self, bs: BitSync) -> Result<(), Error> {
+        self.write(wr_reg![GBSYNC, bs.as_bits()]).await
     }
 
     /// Set the generic packet control register.
-    pub fn set_pkt_ctrl(&mut self, pkt_ctrl: PktCtrl) -> Result<(), Error> {
-        self.write(wr_reg![GPKTCTL1A, pkt_ctrl.as_bits()])
+    pub async fn set_pkt_ctrl(&mut self, pkt_ctrl: PktCtrl) -> Result<(), Error> {
+        self.write(wr_reg![GPKTCTL1A, pkt_ctrl.as_bits()]).await
     }
 
     /// Set the initial value for generic packet whitening.
     ///
     /// This sets the first 8 bits, the 9th bit is set with
     /// [`set_pkt_ctrl`](Self::set_pkt_ctrl).
-    pub fn set_init_whitening(&mut self, init: u8) -> Result<(), Error> {
-        self.write(wr_reg![GWHITEINIRL, init])
+    pub async fn set_init_whitening(&mut self, init: u8) -> Result<(), Error> {
+        self.write(wr_reg![GWHITEINIRL, init]).await
     }
 
     /// Set the initial value for generic packet CRC polynomial.
@@ -377,9 +412,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_crc_polynomial(0x1D0F)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_crc_polynomial(&mut self, polynomial: u16) -> Result<(), Error> {
+    pub async fn set_crc_polynomial(&mut self, polynomial: u16) -> Result<(), Error> {
         let bytes: [u8; 2] = polynomial.to_be_bytes();
-        self.write(wr_reg![GCRCINIRH, bytes[0], bytes[1]])
+        self.write(wr_reg![GCRCINIRH, bytes[0], bytes[1]]).await
     }
 
     /// Set the generic packet CRC polynomial.
@@ -391,9 +426,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_initial_crc_polynomial(0x1021)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_initial_crc_polynomial(&mut self, polynomial: u16) -> Result<(), Error> {
+    pub async fn set_initial_crc_polynomial(&mut self, polynomial: u16) -> Result<(), Error> {
         let bytes: [u8; 2] = polynomial.to_be_bytes();
-        self.write(wr_reg![GCRCPOLRH, bytes[0], bytes[1]])
+        self.write(wr_reg![GCRCPOLRH, bytes[0], bytes[1]]).await
     }
 
     /// Set the synchronization word registers.
@@ -407,8 +442,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_sync_word(&SYNC_WORD)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_sync_word(&mut self, sync_word: &[u8; 8]) -> Result<(), Error> {
-        self.write_register(Register::GSYNC7, sync_word)
+    pub async fn set_sync_word(&mut self, sync_word: &[u8; 8]) -> Result<(), Error> {
+        self.write_register(Register::GSYNC7, sync_word).await
     }
 
     /// Set the LoRa synchronization word registers.
@@ -423,9 +458,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_lora_sync_word(LoRaSyncWord::Public)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_lora_sync_word(&mut self, sync_word: LoRaSyncWord) -> Result<(), Error> {
+    pub async fn set_lora_sync_word(&mut self, sync_word: LoRaSyncWord) -> Result<(), Error> {
         let bytes: [u8; 2] = sync_word.bytes();
-        self.write(wr_reg![LSYNCH, bytes[0], bytes[1]])
+        self.write(wr_reg![LSYNCH, bytes[0], bytes[1]]).await
     }
 
     /// Set the RX gain control.
@@ -439,8 +474,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_rx_gain(PMode::Boost)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_rx_gain(&mut self, pmode: PMode) -> Result<(), Error> {
-        self.write(wr_reg![RXGAINC, pmode as u8])
+    pub async fn set_rx_gain(&mut self, pmode: PMode) -> Result<(), Error> {
+        self.write(wr_reg![RXGAINC, pmode as u8]).await
     }
 
     /// Set the power amplifier over current protection.
@@ -466,8 +501,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_pa_ocp(Ocp::Max140m)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_pa_ocp(&mut self, ocp: Ocp) -> Result<(), Error> {
-        self.write(wr_reg![PAOCP, ocp as u8])
+    pub async fn set_pa_ocp(&mut self, ocp: Ocp) -> Result<(), Error> {
+        self.write(wr_reg![PAOCP, ocp as u8]).await
     }
 
     /// Set the HSE32 crystal OSC_IN load capaitor trimming.
@@ -483,8 +518,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_hse_in_trim(HseTrim::MIN)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_hse_in_trim(&mut self, trim: HseTrim) -> Result<(), Error> {
-        self.write(wr_reg![HSEINTRIM, trim.into()])
+    pub async fn set_hse_in_trim(&mut self, trim: HseTrim) -> Result<(), Error> {
+        self.write(wr_reg![HSEINTRIM, trim.into()]).await
     }
 
     /// Set the HSE32 crystal OSC_OUT load capaitor trimming.
@@ -500,31 +535,35 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_hse_out_trim(HseTrim::MIN)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_hse_out_trim(&mut self, trim: HseTrim) -> Result<(), Error> {
-        self.write(wr_reg![HSEOUTTRIM, trim.into()])
+    pub async fn set_hse_out_trim(&mut self, trim: HseTrim) -> Result<(), Error> {
+        self.write(wr_reg![HSEOUTTRIM, trim.into()]).await
     }
 
     /// Set the SMPS clock detection enabled.
     ///
     /// SMPS clock detection must be enabled fore enabling the SMPS.
-    pub fn set_smps_clock_det_en(&mut self, en: bool) -> Result<(), Error> {
-        self.write(wr_reg![SMPSC0, (en as u8) << 6])
+    pub async fn set_smps_clock_det_en(&mut self, en: bool) -> Result<(), Error> {
+        self.write(wr_reg![SMPSC0, (en as u8) << 6]).await
     }
 
     /// Set the power current limiting.
-    pub fn set_pwr_ctrl(&mut self, pwr_ctrl: PwrCtrl) -> Result<(), Error> {
-        self.write(wr_reg![PC, pwr_ctrl.as_bits()])
+    pub async fn set_pwr_ctrl(&mut self, pwr_ctrl: PwrCtrl) -> Result<(), Error> {
+        self.write(wr_reg![PC, pwr_ctrl.as_bits()]).await
     }
 
     /// Set the maximum SMPS drive capability.
-    pub fn set_smps_drv(&mut self, drv: SmpsDrv) -> Result<(), Error> {
-        self.write(wr_reg![SMPSC2, (drv as u8) << 1])
+    pub async fn set_smps_drv(&mut self, drv: SmpsDrv) -> Result<(), Error> {
+        self.write(wr_reg![SMPSC2, (drv as u8) << 1]).await
     }
 }
 
 // 5.8.3
 /// Operating mode commands
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Put the radio into sleep mode.
     ///
     /// This command is only accepted in standby mode.
@@ -557,8 +596,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// unsafe { wakeup() };
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub unsafe fn set_sleep(&mut self, cfg: SleepCfg) -> Result<(), Error> {
-        self.write(&[OpCode::SetSleep as u8, u8::from(cfg)])
+    pub async unsafe fn set_sleep(&mut self, cfg: SleepCfg) -> Result<(), Error> {
+        self.write(&[OpCode::SetSleep as u8, u8::from(cfg)]).await
     }
 
     /// Put the radio into standby mode.
@@ -590,8 +629,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_standby(StandbyClk::Hse)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_standby(&mut self, standby_clk: StandbyClk) -> Result<(), Error> {
+    pub async fn set_standby(&mut self, standby_clk: StandbyClk) -> Result<(), Error> {
         self.write(&[OpCode::SetStandby as u8, u8::from(standby_clk)])
+            .await
     }
 
     /// Put the subghz radio into frequency synthesis mode.
@@ -615,8 +655,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// ```
     ///
     /// [`set_rf_frequency`]: crate::subghz::SubGhz::set_rf_frequency
-    pub fn set_fs(&mut self) -> Result<(), Error> {
-        self.write(&[OpCode::SetFs.into()])
+    pub async fn set_fs(&mut self) -> Result<(), Error> {
+        self.write(&[OpCode::SetFs.into()]).await
     }
 
     /// Set the sub-GHz radio in TX mode.
@@ -632,7 +672,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx(Timeout::DISABLED)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tx(&mut self, timeout: Timeout) -> Result<(), Error> {
+    pub async fn set_tx(&mut self, timeout: Timeout) -> Result<(), Error> {
         let tobits: u32 = timeout.into_bits();
         self.write(&[
             OpCode::SetTx.into(),
@@ -640,6 +680,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
             (tobits >> 8) as u8,
             tobits as u8,
         ])
+        .await
     }
 
     /// Set the sub-GHz radio in RX mode.
@@ -656,7 +697,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_rx(Timeout::from_duration_sat(Duration::from_secs(1)))?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_rx(&mut self, timeout: Timeout) -> Result<(), Error> {
+    pub async fn set_rx(&mut self, timeout: Timeout) -> Result<(), Error> {
         let tobits: u32 = timeout.into_bits();
         self.write(&[
             OpCode::SetRx.into(),
@@ -664,6 +705,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
             (tobits >> 8) as u8,
             tobits as u8,
         ])
+        .await
     }
 
     /// Allows selection of the receiver event which stops the RX timeout timer.
@@ -679,11 +721,15 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_rx_timeout_stop(RxTimeoutStop::Preamble)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_rx_timeout_stop(&mut self, rx_timeout_stop: RxTimeoutStop) -> Result<(), Error> {
+    pub async fn set_rx_timeout_stop(
+        &mut self,
+        rx_timeout_stop: RxTimeoutStop,
+    ) -> Result<(), Error> {
         self.write(&[
             OpCode::SetStopRxTimerOnPreamble.into(),
             rx_timeout_stop.into(),
         ])
+        .await
     }
 
     /// Put the radio in non-continuous RX mode.
@@ -732,7 +778,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// [`RxDone`]: crate::subghz::Irq::RxDone
     /// [`set_rf_frequency`]: crate::subghz::SubGhz::set_rf_frequency
     /// [`set_standby`]: crate::subghz::SubGhz::set_standby
-    pub fn set_rx_duty_cycle(
+    pub async fn set_rx_duty_cycle(
         &mut self,
         rx_period: Timeout,
         sleep_period: Timeout,
@@ -748,6 +794,7 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
             (sleep_period_bits >> 8) as u8,
             sleep_period_bits as u8,
         ])
+        .await
     }
 
     /// Channel Activity Detection (CAD) with LoRa packets.
@@ -784,8 +831,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// ```
     ///
     /// [`set_cad_params`]: crate::subghz::SubGhz::set_cad_params
-    pub fn set_cad(&mut self) -> Result<(), Error> {
-        self.write(&[OpCode::SetCad.into()])
+    pub async fn set_cad(&mut self) -> Result<(), Error> {
+        self.write(&[OpCode::SetCad.into()]).await
     }
 
     /// Generate a continuous transmit tone at the RF-PLL frequency.
@@ -800,8 +847,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx_continuous_wave()?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tx_continuous_wave(&mut self) -> Result<(), Error> {
-        self.write(&[OpCode::SetTxContinuousWave as u8])
+    pub async fn set_tx_continuous_wave(&mut self) -> Result<(), Error> {
+        self.write(&[OpCode::SetTxContinuousWave as u8]).await
     }
 
     /// Generate an infinite preamble at the RF-PLL frequency.
@@ -819,14 +866,18 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx_continuous_preamble()?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tx_continuous_preamble(&mut self) -> Result<(), Error> {
-        self.write(&[OpCode::SetTxContinuousPreamble as u8])
+    pub async fn set_tx_continuous_preamble(&mut self) -> Result<(), Error> {
+        self.write(&[OpCode::SetTxContinuousPreamble as u8]).await
     }
 }
 
 // 5.8.4
 /// Radio configuration commands
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Set the packet type (modulation scheme).
     ///
     /// # Examples
@@ -870,8 +921,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_packet_type(PacketType::Msk)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_packet_type(&mut self, packet_type: PacketType) -> Result<(), Error> {
+    pub async fn set_packet_type(&mut self, packet_type: PacketType) -> Result<(), Error> {
         self.write(&[OpCode::SetPacketType as u8, packet_type as u8])
+            .await
     }
 
     /// Get the packet type.
@@ -886,8 +938,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// assert_eq!(sg.packet_type()?, Ok(PacketType::LoRa));
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn packet_type(&mut self) -> Result<Result<PacketType, u8>, Error> {
-        let pkt_type: [u8; 2] = self.read_n(OpCode::GetPacketType)?;
+    pub async fn packet_type(&mut self) -> Result<Result<PacketType, u8>, Error> {
+        let pkt_type: [u8; 2] = self.read_n(OpCode::GetPacketType).await?;
         Ok(PacketType::from_raw(pkt_type[1]))
     }
 
@@ -904,8 +956,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_rf_frequency(&RfFreq::F915)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_rf_frequency(&mut self, freq: &RfFreq) -> Result<(), Error> {
-        self.write(freq.as_slice())
+    pub async fn set_rf_frequency(&mut self, freq: &RfFreq) -> Result<(), Error> {
+        self.write(freq.as_slice()).await
     }
 
     /// Set the transmit output power and the PA ramp-up time.
@@ -931,8 +983,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx_params(&TX_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tx_params(&mut self, params: &TxParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_tx_params(&mut self, params: &TxParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Power amplifier configuation.
@@ -960,8 +1012,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx_params(&TX_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_pa_config(&mut self, pa_config: &PaConfig) -> Result<(), Error> {
-        self.write(pa_config.as_slice())
+    pub async fn set_pa_config(&mut self, pa_config: &PaConfig) -> Result<(), Error> {
+        self.write(pa_config.as_slice()).await
     }
 
     /// Operating mode to enter after a successful packet transmission or
@@ -978,8 +1030,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tx_rx_fallback_mode(FallbackMode::Standby)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tx_rx_fallback_mode(&mut self, fm: FallbackMode) -> Result<(), Error> {
+    pub async fn set_tx_rx_fallback_mode(&mut self, fm: FallbackMode) -> Result<(), Error> {
         self.write(&[OpCode::SetTxRxFallbackMode as u8, fm as u8])
+            .await
     }
 
     /// Set channel activity detection (CAD) parameters.
@@ -1004,8 +1057,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_cad()?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_cad_params(&mut self, params: &CadParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_cad_params(&mut self, params: &CadParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the data buffer base address for the packet handling in TX and RX.
@@ -1026,8 +1079,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     ///
     /// [`read_buffer`]: SubGhz::read_buffer
     /// [`write_buffer`]: SubGhz::write_buffer
-    pub fn set_buffer_base_address(&mut self, tx: u8, rx: u8) -> Result<(), Error> {
+    pub async fn set_buffer_base_address(&mut self, tx: u8, rx: u8) -> Result<(), Error> {
         self.write(&[OpCode::SetBufferBaseAddress as u8, tx, rx])
+            .await
     }
 
     /// Set the (G)FSK modulation parameters.
@@ -1055,8 +1109,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_fsk_mod_params(&MOD_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_fsk_mod_params(&mut self, params: &FskModParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_fsk_mod_params(&mut self, params: &FskModParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the LoRa modulation parameters.
@@ -1079,8 +1133,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_lora_mod_params(&MOD_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_lora_mod_params(&mut self, params: &LoRaModParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_lora_mod_params(&mut self, params: &LoRaModParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the BPSK modulation parameters.
@@ -1097,8 +1151,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_bpsk_mod_params(&MOD_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_bpsk_mod_params(&mut self, params: &BpskModParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_bpsk_mod_params(&mut self, params: &BpskModParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the generic (FSK) packet parameters.
@@ -1125,8 +1179,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_packet_params(&PKT_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_packet_params(&mut self, params: &GenericPacketParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_packet_params(&mut self, params: &GenericPacketParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the BPSK packet parameters.
@@ -1141,8 +1195,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_bpsk_packet_params(&BpskPacketParams::new().set_payload_len(64))?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_bpsk_packet_params(&mut self, params: &BpskPacketParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_bpsk_packet_params(&mut self, params: &BpskPacketParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the LoRa packet parameters.
@@ -1164,8 +1218,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_lora_packet_params(&PKT_PARAMS)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_lora_packet_params(&mut self, params: &LoRaPacketParams) -> Result<(), Error> {
-        self.write(params.as_slice())
+    pub async fn set_lora_packet_params(&mut self, params: &LoRaPacketParams) -> Result<(), Error> {
+        self.write(params.as_slice()).await
     }
 
     /// Set the number of LoRa symbols to be received before starting the
@@ -1185,14 +1239,18 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_lora_symb_timeout(0)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_lora_symb_timeout(&mut self, n: u8) -> Result<(), Error> {
-        self.write(&[OpCode::SetLoRaSymbTimeout.into(), n])
+    pub async fn set_lora_symb_timeout(&mut self, n: u8) -> Result<(), Error> {
+        self.write(&[OpCode::SetLoRaSymbTimeout.into(), n]).await
     }
 }
 
 // 5.8.5
 /// Communication status and information commands
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Get the radio status.
     ///
     /// The hardware (or documentation) appears to have many bugs where this
@@ -1208,8 +1266,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// ```
     ///
     /// [link]: https://community.st.com/s/question/0D53W00000hR9GQSA0/stm32wl55-getstatus-command-returns-reserved-cmdstatus
-    pub fn status(&mut self) -> Result<Status, Error> {
-        Ok(self.read_1(OpCode::GetStatus)?.into())
+    pub async fn status(&mut self) -> Result<Status, Error> {
+        Ok(self.read_1(OpCode::GetStatus).await?.into())
     }
 
     /// Get the RX buffer status.
@@ -1236,8 +1294,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// }
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn rx_buffer_status(&mut self) -> Result<(Status, u8, u8), Error> {
-        let data: [u8; 3] = self.read_n(OpCode::GetRxBufferStatus)?;
+    pub async fn rx_buffer_status(&mut self) -> Result<(Status, u8, u8), Error> {
+        let data: [u8; 3] = self.read_n(OpCode::GetRxBufferStatus).await?;
         Ok((data[0].into(), data[1], data[2]))
     }
 
@@ -1263,8 +1321,10 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// }
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn fsk_packet_status(&mut self) -> Result<FskPacketStatus, Error> {
-        Ok(FskPacketStatus::from(self.read_n(OpCode::GetPacketStatus)?))
+    pub async fn fsk_packet_status(&mut self) -> Result<FskPacketStatus, Error> {
+        Ok(FskPacketStatus::from(
+            self.read_n(OpCode::GetPacketStatus).await?,
+        ))
     }
 
     /// Returns information on the last received LoRa packet.
@@ -1289,9 +1349,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// }
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn lora_packet_status(&mut self) -> Result<LoRaPacketStatus, Error> {
+    pub async fn lora_packet_status(&mut self) -> Result<LoRaPacketStatus, Error> {
         Ok(LoRaPacketStatus::from(
-            self.read_n(OpCode::GetPacketStatus)?,
+            self.read_n(OpCode::GetPacketStatus).await?,
         ))
     }
 
@@ -1314,8 +1374,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// writeln!(&mut uart, "RSSI: {} dBm", rssi);
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn rssi_inst(&mut self) -> Result<(Status, Ratio<i16>), Error> {
-        let data: [u8; 2] = self.read_n(OpCode::GetRssiInst)?;
+    pub async fn rssi_inst(&mut self) -> Result<(Status, Ratio<i16>), Error> {
+        let data: [u8; 2] = self.read_n(OpCode::GetRssiInst).await?;
         let status: Status = data[0].into();
         let rssi: Ratio<i16> = Ratio::new_raw(i16::from(data[1]), -2);
 
@@ -1335,8 +1395,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.reset_stats()?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn fsk_stats(&mut self) -> Result<Stats<FskStats>, Error> {
-        let data: [u8; 7] = self.read_n(OpCode::GetStats)?;
+    pub async fn fsk_stats(&mut self) -> Result<Stats<FskStats>, Error> {
+        let data: [u8; 7] = self.read_n(OpCode::GetStats).await?;
         Ok(Stats::from_raw_fsk(data))
     }
 
@@ -1353,8 +1413,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.reset_stats()?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn lora_stats(&mut self) -> Result<Stats<LoRaStats>, Error> {
-        let data: [u8; 7] = self.read_n(OpCode::GetStats)?;
+    pub async fn lora_stats(&mut self) -> Result<Stats<LoRaStats>, Error> {
+        let data: [u8; 7] = self.read_n(OpCode::GetStats).await?;
         Ok(Stats::from_raw_lora(data))
     }
 
@@ -1371,15 +1431,19 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     ///
     /// [`lora_stats`]: crate::subghz::SubGhz::lora_stats
     /// [`fsk_stats`]: crate::subghz::SubGhz::fsk_stats
-    pub fn reset_stats(&mut self) -> Result<(), Error> {
+    pub async fn reset_stats(&mut self) -> Result<(), Error> {
         const RESET_STATS: [u8; 7] = [0x00; 7];
-        self.write(&RESET_STATS)
+        self.write(&RESET_STATS).await
     }
 }
 
 // 5.8.6
 /// IRQ commands
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Set the interrupt configuration.
     ///
     /// # Example
@@ -1396,8 +1460,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_irq_cfg(&IRQ_CFG)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_irq_cfg(&mut self, cfg: &CfgIrq) -> Result<(), Error> {
-        self.write(cfg.as_slice())
+    pub async fn set_irq_cfg(&mut self, cfg: &CfgIrq) -> Result<(), Error> {
+        self.write(cfg.as_slice()).await
     }
 
     /// Get the IRQ status.
@@ -1424,8 +1488,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// }
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn irq_status(&mut self) -> Result<(Status, u16), Error> {
-        let data: [u8; 3] = self.read_n(OpCode::GetIrqStatus)?;
+    pub async fn irq_status(&mut self) -> Result<(Status, u16), Error> {
+        let data: [u8; 3] = self.read_n(OpCode::GetIrqStatus).await?;
         let irq_status: u16 = u16::from_be_bytes([data[1], data[2]]);
         Ok((data[0].into(), irq_status))
     }
@@ -1446,14 +1510,19 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     ///
     /// [`TxDone`]: crate::subghz::Irq::TxDone
     /// [`RxDone`]: crate::subghz::Irq::RxDone
-    pub fn clear_irq_status(&mut self, mask: u16) -> Result<(), Error> {
+    pub async fn clear_irq_status(&mut self, mask: u16) -> Result<(), Error> {
         self.write(&[OpCode::ClrIrqStatus as u8, (mask >> 8) as u8, mask as u8])
+            .await
     }
 }
 
 // 5.8.7
 /// Miscellaneous commands
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Calibrate one or several blocks at any time when in standby mode.
     ///
     /// The blocks to calibrate are defined by `cal` argument.
@@ -1474,9 +1543,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.calibrate(Calibrate::Rc13M.mask() | Calibrate::Pll.mask())?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn calibrate(&mut self, cal: u8) -> Result<(), Error> {
+    pub async fn calibrate(&mut self, cal: u8) -> Result<(), Error> {
         // bit 7 is reserved and must be kept at reset value.
-        self.write(&[OpCode::Calibrate as u8, cal & 0x7F])
+        self.write(&[OpCode::Calibrate as u8, cal & 0x7F]).await
     }
 
     /// Calibrate the image at the given frequencies.
@@ -1495,8 +1564,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.calibrate_image(CalibrateImage::ISM_430_440)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn calibrate_image(&mut self, cal: CalibrateImage) -> Result<(), Error> {
+    pub async fn calibrate_image(&mut self, cal: CalibrateImage) -> Result<(), Error> {
         self.write(&[OpCode::CalibrateImage as u8, cal.0, cal.1])
+            .await
     }
 
     /// Set the radio power supply.
@@ -1522,8 +1592,9 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_regulator_mode(RegMode::Smps)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_regulator_mode(&mut self, reg_mode: RegMode) -> Result<(), Error> {
+    pub async fn set_regulator_mode(&mut self, reg_mode: RegMode) -> Result<(), Error> {
         self.write(&[OpCode::SetRegulatorMode as u8, reg_mode as u8])
+            .await
     }
 
     /// Get the radio operational errors.
@@ -1540,8 +1611,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// }
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn op_error(&mut self) -> Result<(Status, u16), Error> {
-        let data: [u8; 3] = self.read_n(OpCode::GetError)?;
+    pub async fn op_error(&mut self) -> Result<(Status, u16), Error> {
+        let data: [u8; 3] = self.read_n(OpCode::GetError).await?;
         Ok((data[0].into(), u16::from_le_bytes([data[1], data[2]])))
     }
 
@@ -1562,14 +1633,18 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// ```
     ///
     /// [`op_error`]: crate::subghz::SubGhz::op_error
-    pub fn clear_error(&mut self) -> Result<(), Error> {
-        self.write(&[OpCode::ClrError as u8, 0x00])
+    pub async fn clear_error(&mut self) -> Result<(), Error> {
+        self.write(&[OpCode::ClrError as u8, 0x00]).await
     }
 }
 
 // 5.8.8
 /// Set TCXO mode command
-impl<'d> SubGhz<'d, NoDma, NoDma> {
+impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx>
+where
+    Tx: TxDmaChannel<SUBGHZSPI>,
+    Rx: RxDmaChannel<SUBGHZSPI>,
+{
     /// Set the TCXO trim and HSE32 ready timeout.
     ///
     /// # Example
@@ -1586,8 +1661,8 @@ impl<'d> SubGhz<'d, NoDma, NoDma> {
     /// sg.set_tcxo_mode(&TCXO_MODE)?;
     /// # Ok::<(), embassy_stm32::subghz::Error>(())
     /// ```
-    pub fn set_tcxo_mode(&mut self, tcxo_mode: &TcxoMode) -> Result<(), Error> {
-        self.write(tcxo_mode.as_slice())
+    pub async fn set_tcxo_mode(&mut self, tcxo_mode: &TcxoMode) -> Result<(), Error> {
+        self.write(tcxo_mode.as_slice()).await
     }
 }
 

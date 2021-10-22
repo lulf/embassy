@@ -11,7 +11,6 @@ mod example_common;
 use embassy_lora::{stm32wl::*, LoraTimer};
 use embassy_stm32::{
     dbgmcu::Dbgmcu,
-    dma::NoDma,
     gpio::{Level, Output, Pin, Speed},
     interrupt, pac, rcc,
     rng::Rng,
@@ -43,11 +42,17 @@ async fn main(_spawner: embassy::executor::Spawner, p: Peripherals) {
     let ctrl3 = Output::new(p.PC5.degrade(), Level::High, Speed::High);
     let rfs = RadioSwitch::new(ctrl1, ctrl2, ctrl3);
 
-    let radio = SubGhz::new(p.SUBGHZSPI, p.PA5, p.PA7, p.PA6, NoDma, NoDma);
-
     let irq = interrupt::take!(SUBGHZ_RADIO);
-    static mut RADIO_STATE: SubGhzState<'static> = SubGhzState::new();
-    let radio = unsafe { SubGhzRadio::new(&mut RADIO_STATE, radio, rfs, irq) };
+    let radio = SubGhz::new(
+        p.SUBGHZSPI,
+        p.PA5,
+        p.PA7,
+        p.PA6,
+        p.DMA1_CH0,
+        p.DMA1_CH1,
+        irq,
+    );
+    let radio = SubGhzRadio::new(radio, rfs);
 
     let region = region::EU868::default().into();
     let mut radio_buffer = [0; 256];

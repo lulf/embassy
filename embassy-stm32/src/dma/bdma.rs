@@ -253,6 +253,7 @@ pac::interrupts! {
     ($peri:ident, bdma, $block:ident, $signal_name:ident, $irq:ident) => {
         #[crate::interrupt]
         unsafe fn $irq () {
+            info!("BDMA IRQ");
             on_irq()
         }
     };

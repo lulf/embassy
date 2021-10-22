@@ -159,6 +159,8 @@ impl<'a> ExtiInputFuture<'a> {
             cpu_regs().imr(0).modify(|w| w.set_line(pin, true));
         });
 
+        info!("Awaiting interrupt");
+
         Self {
             pin,
             phantom: PhantomData,
@@ -228,6 +230,7 @@ macro_rules! impl_irq {
     ($e:ident) => {
         #[interrupt]
         unsafe fn $e() {
+            info!("EXTI IRQ");
             on_irq()
         }
     };

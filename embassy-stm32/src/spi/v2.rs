@@ -422,7 +422,7 @@ impl<'d, T: Instance, Rx> embedded_hal::blocking::spi::Write<u16> for Spi<'d, T,
     }
 }
 
-impl<'d, T: Instance> embedded_hal::blocking::spi::Transfer<u16> for Spi<'d, T, NoDma, NoDma> {
+impl<'d, T: Instance, Tx, Rx> embedded_hal::blocking::spi::Transfer<u16> for Spi<'d, T, Tx, Rx> {
     type Error = Error;
 
     fn transfer<'w>(&mut self, words: &'w mut [u16]) -> Result<&'w [u16], Self::Error> {
