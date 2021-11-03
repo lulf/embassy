@@ -2,6 +2,8 @@ use crate::gpio::sealed::AFType::{OutputOpenDrain, OutputPushPull};
 use core::future::Future;
 use core::marker::PhantomData;
 use embassy::util::Unborrow;
+use embassy::waitqueue::WakerRegistration;
+use embassy_hal_common::ring_buffer::RingBuffer;
 use embassy_hal_common::unborrow;
 use futures::TryFutureExt;
 
@@ -172,3 +174,65 @@ impl<'d, T: Instance, TxDma, RxDma> embassy_traits::uart::Read for Uart<'d, T, T
         self.read_dma(buf).map_err(|_| embassy_traits::uart::Error::Other)
     }
 }
+
+// Functions required for buffered uart
+fn on_buffered_rx<T: Instance>(
+    uart: &mut Uart<'_, T, NoDma, NoDma>,
+    rx: &mut RingBuffer<'_>,
+    rx_waker: &mut WakerRegistration,
+) {
+    let r = uart.inner.regs();
+    unsafe {
+        let sr = r.sr().read();
+        if sr.pe() {
+            r.dr().read();
+            trace!("Parity error");
+        } else if sr.fe() {
+            r.dr().read();
+            trace!("Framing error");
+        } else if sr.ne() {
+            r.dr().read();
+            trace!("Noise error");
+        } else if sr.ore() {
+            r.dr().read();
+            trace!("Overrun error");
+        } else if sr.rxne() {
+            let buf = rx.push_buf();
+            if buf.is_empty() {
+                rx_waker.wake();
+            } else {
+                buf[0] = r.dr().read().0 as u8;
+                rx.push(1);
+            }
+        } else if sr.idle() {
+            r.dr().read();
+            rx_waker.wake();
+        };
+    }
+}
+
+fn on_buffered_tx<T: Instance>(
+    uart: &mut Uart<'_, T, NoDma, NoDma>,
+    tx: &mut RingBuffer<'_>,
+    tx_waker: &mut WakerRegistration,
+) {
+    let r = uart.inner.regs();
+    unsafe {
+        if r.sr().read().txe() {
+            let buf = tx.pop_buf();
+            if !buf.is_empty() {
+                r.dr().write_value(regs::Dr(buf[0].into()));
+                tx.pop(1);
+                tx_waker.wake();
+            } else {
+                // Disable interrupt until we have something to transmit again
+                r.cr1().modify(|w| {
+                    w.set_txeie(false);
+                });
+            }
+        }
+    }
+}
+
+mod buffered_uart;
+pub use buffered_uart::*;
