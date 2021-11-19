@@ -52,14 +52,17 @@ where
     pub(crate) async fn configure(&mut self) -> Result<(), RadioError> {
         info!("Configuring STM32WL SUBGHZ radio");
         self.radio.set_standby(StandbyClk::Rc).await?;
+        info!("Set standby mode");
         let tcxo_mode = TcxoMode::new()
             .set_txco_trim(TcxoTrim::Volts1pt7)
             .set_timeout(Timeout::from_duration_sat(
                 core::time::Duration::from_millis(40),
             ));
 
-        self.radio.set_tcxo_mode(&tcxo_mode).await?;
-        self.radio.set_regulator_mode(RegMode::Ldo).await?;
+        //self.radio.set_tcxo_mode(&tcxo_mode).await?;
+        info!("Set Tcxo mode");
+        //self.radio.set_regulator_mode(RegMode::Ldo).await?;
+        loop {}
 
         self.radio
             .calibrate_image(CalibrateImage::ISM_863_870)
@@ -161,8 +164,9 @@ where
         config: RfConfig,
         buf: &mut [u8],
     ) -> Result<(usize, RxQuality), RadioError> {
-        assert!(buf.len() >= 255);
         info!("RX START");
+        loop {}
+        assert!(buf.len() >= 255);
         // trace!("Starting RX: {}", config);
         self.switch.set_rx();
         self.configure().await?;

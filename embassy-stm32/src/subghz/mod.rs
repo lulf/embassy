@@ -258,6 +258,8 @@ where
 
         unsafe { wakeup() };
 
+        info!("Woken up");
+
         SubGhz { spi, irq }
     }
 
