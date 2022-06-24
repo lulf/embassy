@@ -180,6 +180,18 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         )
     }
 
+    /// Useful for on chip peripherals like SUBGHZ which are hardwired.
+    /// The bus can optionally be exposed externally with `Spi::new()` still.
+    pub fn new_internal(
+        peri: impl Unborrow<Target = T> + 'd,
+        txdma: impl Unborrow<Target = Tx> + 'd,
+        rxdma: impl Unborrow<Target = Rx> + 'd,
+        freq: Hertz,
+        config: Config,
+    ) -> Self {
+        Self::new_inner(peri, None, None, None, txdma, rxdma, freq, config)
+    }
+
     fn new_inner(
         _peri: impl Unborrow<Target = T> + 'd,
         sck: Option<AnyPin>,

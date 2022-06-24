@@ -81,7 +81,7 @@ pub use value_error::ValueError;
 use crate::dma::NoDma;
 use crate::peripherals::SUBGHZSPI;
 use crate::rcc::sealed::RccPeripheral;
-use crate::spi::{BitOrder, Config as SpiConfig, MisoPin, MosiPin, SckPin, Spi, MODE_0};
+use crate::spi::{BitOrder, Config as SpiConfig, Spi, MODE_0};
 use crate::time::Hertz;
 use crate::{pac, Unborrow};
 
@@ -212,9 +212,6 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
     /// clock.
     pub fn new(
         peri: impl Unborrow<Target = SUBGHZSPI> + 'd,
-        sck: impl Unborrow<Target = impl SckPin<SUBGHZSPI>> + 'd,
-        mosi: impl Unborrow<Target = impl MosiPin<SUBGHZSPI>> + 'd,
-        miso: impl Unborrow<Target = impl MisoPin<SUBGHZSPI>> + 'd,
         txdma: impl Unborrow<Target = Tx> + 'd,
         rxdma: impl Unborrow<Target = Rx> + 'd,
     ) -> Self {
@@ -227,7 +224,7 @@ impl<'d, Tx, Rx> SubGhz<'d, Tx, Rx> {
         let mut config = SpiConfig::default();
         config.mode = MODE_0;
         config.bit_order = BitOrder::MsbFirst;
-        let spi = Spi::new(peri, sck, mosi, miso, txdma, rxdma, clk, config);
+        let spi = Spi::new_internal(peri, txdma, rxdma, clk, config);
 
         unsafe { wakeup() };
 
