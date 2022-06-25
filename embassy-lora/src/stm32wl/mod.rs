@@ -1,18 +1,18 @@
 //! A radio driver integration for the radio found on STM32WL family devices.
 use core::future::Future;
-use core::mem::MaybeUninit;
+use core::task::Poll;
 
-use embassy::channel::signal::Signal;
-use embassy_hal_common::unborrow;
+use embassy::waitqueue::AtomicWaker;
+use embassy_hal_common::{unborrow, Unborrow};
 use embassy_stm32::dma::NoDma;
 use embassy_stm32::gpio::{AnyPin, Output};
-use embassy_stm32::interrupt::{InterruptExt, SUBGHZ_RADIO};
+use embassy_stm32::interrupt::{Interrupt, InterruptExt, SUBGHZ_RADIO};
 use embassy_stm32::subghz::{
     CalibrateImage, CfgIrq, CodingRate, Error, HeaderType, Irq, LoRaBandwidth, LoRaModParams, LoRaPacketParams,
     LoRaSyncWord, Ocp, PaConfig, PaSel, PacketType, RampTime, RegMode, RfFreq, SpreadingFactor as SF, StandbyClk,
     Status, SubGhz, TcxoMode, TcxoTrim, Timeout, TxParams,
 };
-use embassy_stm32::Unborrow;
+use futures::future::poll_fn;
 use lorawan_device::async_device::radio::{Bandwidth, PhyRxTx, RfConfig, RxQuality, SpreadingFactor, TxConfig};
 use lorawan_device::async_device::Timings;
 
@@ -28,65 +28,35 @@ pub enum State {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RadioError;
 
-static IRQ: Signal<(Status, u16)> = Signal::new();
-
-struct StateInner<'a> {
-    radio: SubGhz<'a, NoDma, NoDma>,
-    switch: RadioSwitch<'a>,
-}
-
-/// External state storage for the radio state
-pub struct SubGhzState<'a>(MaybeUninit<StateInner<'a>>);
-impl<'a> SubGhzState<'a> {
-    pub const fn new() -> Self {
-        Self(MaybeUninit::uninit())
-    }
-}
+static IRQ_WAKER: AtomicWaker = AtomicWaker::new();
 
 /// The radio peripheral keeping the radio state and owning the radio IRQ.
 pub struct SubGhzRadio<'a> {
-    state: *mut StateInner<'a>,
-    _irq: SUBGHZ_RADIO,
+    radio: SubGhz<'a, NoDma, NoDma>,
+    switch: RadioSwitch<'a>,
+    irq: SUBGHZ_RADIO,
 }
 
 impl<'a> SubGhzRadio<'a> {
     /// Create a new instance of a SubGhz radio for LoRaWAN.
-    ///
-    /// # Safety
-    /// Do not leak self or futures
-    pub unsafe fn new(
-        state: &'a mut SubGhzState<'a>,
-        radio: SubGhz<'a, NoDma, NoDma>,
+    pub fn new(
+        mut radio: SubGhz<'a, NoDma, NoDma>,
         switch: RadioSwitch<'a>,
         irq: impl Unborrow<Target = SUBGHZ_RADIO>,
     ) -> Self {
         unborrow!(irq);
 
-        let mut inner = StateInner { radio, switch };
-        inner.radio.reset();
-
-        let state_ptr = state.0.as_mut_ptr();
-        state_ptr.write(inner);
+        radio.reset();
 
         irq.disable();
-        irq.set_handler(|p| {
-            // This is safe because we only get interrupts when configured for, so
-            // the radio will be awaiting on the signal at this point. If not, the ISR will
-            // anyway only adjust the state in the IRQ signal state.
-            let state = &mut *(p as *mut StateInner<'a>);
-            state.on_interrupt();
+        irq.set_handler(|_| {
+            IRQ_WAKER.wake();
+            unsafe { SUBGHZ_RADIO::steal().disable() };
         });
-        irq.set_handler_context(state_ptr as *mut ());
-        irq.enable();
 
-        Self {
-            state: state_ptr,
-            _irq: irq,
-        }
+        Self { radio, switch, irq }
     }
-}
 
-impl<'a> StateInner<'a> {
     /// Configure radio settings in preparation for TX or RX
     pub(crate) fn configure(&mut self) -> Result<(), RadioError> {
         trace!("Configuring STM32WL SUBGHZ radio");
@@ -151,8 +121,7 @@ impl<'a> StateInner<'a> {
         self.radio.set_tx(Timeout::DISABLED)?;
 
         loop {
-            let (_status, irq_status) = IRQ.wait().await;
-            IRQ.reset();
+            let (_status, irq_status) = self.irq_wait().await;
 
             if irq_status & Irq::TxDone.mask() != 0 {
                 let stats = self.radio.lora_stats()?;
@@ -214,8 +183,8 @@ impl<'a> StateInner<'a> {
         trace!("RX started");
 
         loop {
-            let (status, irq_status) = IRQ.wait().await;
-            IRQ.reset();
+            let (status, irq_status) = self.irq_wait().await;
+
             trace!("RX IRQ {:?}, {:?}", status, irq_status);
             if irq_status & Irq::RxDone.mask() != 0 {
                 let (status, len, ptr) = self.radio.rx_buffer_status()?;
@@ -238,17 +207,24 @@ impl<'a> StateInner<'a> {
         }
     }
 
-    /// Read interrupt status and store in global signal
-    fn on_interrupt(&mut self) {
-        let (status, irq_status) = self.radio.irq_status().expect("error getting irq status");
-        self.radio
-            .clear_irq_status(irq_status)
-            .expect("error clearing irq status");
-        if irq_status & Irq::PreambleDetected.mask() != 0 {
-            trace!("Preamble detected, ignoring");
-        } else {
-            IRQ.signal((status, irq_status));
-        }
+    async fn irq_wait(&mut self) -> (Status, u16) {
+        poll_fn(|cx| {
+            self.irq.unpend();
+            self.irq.enable();
+            IRQ_WAKER.register(cx.waker());
+
+            let (status, irq_status) = self.radio.irq_status().expect("error getting irq status");
+            self.radio
+                .clear_irq_status(irq_status)
+                .expect("error clearing irq status");
+            trace!("IRQ status: {=u16:b}", irq_status);
+            if irq_status == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready((status, irq_status))
+            }
+        })
+        .await
     }
 }
 
@@ -257,18 +233,12 @@ impl PhyRxTx for SubGhzRadio<'static> {
 
     type TxFuture<'m> = impl Future<Output = Result<u32, Self::PhyError>> + 'm;
     fn tx<'m>(&'m mut self, config: TxConfig, buf: &'m [u8]) -> Self::TxFuture<'m> {
-        async move {
-            let inner = unsafe { &mut *self.state };
-            inner.do_tx(config, buf).await
-        }
+        async move { self.do_tx(config, buf).await }
     }
 
     type RxFuture<'m> = impl Future<Output = Result<(usize, RxQuality), Self::PhyError>> + 'm;
     fn rx<'m>(&'m mut self, config: RfConfig, buf: &'m mut [u8]) -> Self::RxFuture<'m> {
-        async move {
-            let inner = unsafe { &mut *self.state };
-            inner.do_rx(config, buf).await
-        }
+        async move { self.do_rx(config, buf).await }
     }
 }
 
