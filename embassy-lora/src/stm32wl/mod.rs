@@ -5,7 +5,6 @@ use core::task::Poll;
 use embassy::waitqueue::AtomicWaker;
 use embassy_hal_common::{unborrow, Unborrow};
 use embassy_stm32::dma::NoDma;
-use embassy_stm32::gpio::{AnyPin, Output};
 use embassy_stm32::interrupt::{Interrupt, InterruptExt, SUBGHZ_RADIO};
 use embassy_stm32::subghz::{
     CalibrateImage, CfgIrq, CodingRate, Error, HeaderType, Irq, LoRaBandwidth, LoRaModParams, LoRaPacketParams,
@@ -31,19 +30,15 @@ pub struct RadioError;
 static IRQ_WAKER: AtomicWaker = AtomicWaker::new();
 
 /// The radio peripheral keeping the radio state and owning the radio IRQ.
-pub struct SubGhzRadio<'a> {
+pub struct SubGhzRadio<'a, RS> {
     radio: SubGhz<'a, NoDma, NoDma>,
-    switch: RadioSwitch<'a>,
+    switch: RS,
     irq: SUBGHZ_RADIO,
 }
 
-impl<'a> SubGhzRadio<'a> {
+impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
     /// Create a new instance of a SubGhz radio for LoRaWAN.
-    pub fn new(
-        mut radio: SubGhz<'a, NoDma, NoDma>,
-        switch: RadioSwitch<'a>,
-        irq: impl Unborrow<Target = SUBGHZ_RADIO>,
-    ) -> Self {
+    pub fn new(mut radio: SubGhz<'a, NoDma, NoDma>, switch: RS, irq: impl Unborrow<Target = SUBGHZ_RADIO>) -> Self {
         unborrow!(irq);
 
         radio.reset();
@@ -92,7 +87,7 @@ impl<'a> SubGhzRadio<'a> {
     async fn do_tx(&mut self, config: TxConfig, buf: &[u8]) -> Result<u32, RadioError> {
         //trace!("TX Request: {}", config);
         trace!("TX START");
-        self.switch.set_tx_lp();
+        self.switch.set_tx();
         self.configure()?;
 
         self.radio
@@ -228,15 +223,15 @@ impl<'a> SubGhzRadio<'a> {
     }
 }
 
-impl PhyRxTx for SubGhzRadio<'static> {
+impl<RS: RadioSwitch> PhyRxTx for SubGhzRadio<'static, RS> {
     type PhyError = RadioError;
 
-    type TxFuture<'m> = impl Future<Output = Result<u32, Self::PhyError>> + 'm;
+    type TxFuture<'m> = impl Future<Output = Result<u32, Self::PhyError>> + 'm where RS: 'm;
     fn tx<'m>(&'m mut self, config: TxConfig, buf: &'m [u8]) -> Self::TxFuture<'m> {
         async move { self.do_tx(config, buf).await }
     }
 
-    type RxFuture<'m> = impl Future<Output = Result<(usize, RxQuality), Self::PhyError>> + 'm;
+    type RxFuture<'m> = impl Future<Output = Result<(usize, RxQuality), Self::PhyError>> + 'm  where RS: 'm;
     fn rx<'m>(&'m mut self, config: RfConfig, buf: &'m mut [u8]) -> Self::RxFuture<'m> {
         async move { self.do_rx(config, buf).await }
     }
@@ -248,7 +243,7 @@ impl<'a> From<embassy_stm32::spi::Error> for RadioError {
     }
 }
 
-impl<'a> Timings for SubGhzRadio<'a> {
+impl<'a, RS> Timings for SubGhzRadio<'a, RS> {
     fn get_rx_window_offset_ms(&self) -> i32 {
         -200
     }
@@ -257,36 +252,9 @@ impl<'a> Timings for SubGhzRadio<'a> {
     }
 }
 
-/// Represents the radio switch found on STM32WL based boards, used to control the radio for transmission or reception.
-pub struct RadioSwitch<'a> {
-    ctrl1: Output<'a, AnyPin>,
-    ctrl2: Output<'a, AnyPin>,
-    ctrl3: Output<'a, AnyPin>,
-}
-
-impl<'a> RadioSwitch<'a> {
-    pub fn new(ctrl1: Output<'a, AnyPin>, ctrl2: Output<'a, AnyPin>, ctrl3: Output<'a, AnyPin>) -> Self {
-        Self { ctrl1, ctrl2, ctrl3 }
-    }
-
-    pub(crate) fn set_rx(&mut self) {
-        self.ctrl1.set_high();
-        self.ctrl2.set_low();
-        self.ctrl3.set_high();
-    }
-
-    pub(crate) fn set_tx_lp(&mut self) {
-        self.ctrl1.set_high();
-        self.ctrl2.set_high();
-        self.ctrl3.set_high();
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_tx_hp(&mut self) {
-        self.ctrl2.set_high();
-        self.ctrl1.set_low();
-        self.ctrl3.set_high();
-    }
+pub trait RadioSwitch {
+    fn set_rx(&mut self);
+    fn set_tx(&mut self);
 }
 
 fn convert_spreading_factor(sf: SpreadingFactor) -> SF {
