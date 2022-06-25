@@ -7,9 +7,9 @@ use embassy_hal_common::{unborrow, Unborrow};
 use embassy_stm32::dma::NoDma;
 use embassy_stm32::interrupt::{Interrupt, InterruptExt, SUBGHZ_RADIO};
 use embassy_stm32::subghz::{
-    CalibrateImage, CfgIrq, CodingRate, Error, HeaderType, Irq, LoRaBandwidth, LoRaModParams, LoRaPacketParams,
-    LoRaSyncWord, Ocp, PaConfig, PaSel, PacketType, RampTime, RegMode, RfFreq, SpreadingFactor as SF, StandbyClk,
-    Status, SubGhz, TcxoMode, TcxoTrim, Timeout, TxParams,
+    CalibrateImage, CfgIrq, CodingRate, Error, HeaderType, HseTrim, Irq, LoRaBandwidth, LoRaModParams,
+    LoRaPacketParams, LoRaSyncWord, Ocp, PaConfig, PacketType, RampTime, RegMode, RfFreq, SpreadingFactor as SF,
+    StandbyClk, Status, SubGhz, TcxoMode, TcxoTrim, Timeout, TxParams,
 };
 use futures::future::poll_fn;
 use lorawan_device::async_device::radio::{Bandwidth, PhyRxTx, RfConfig, RxQuality, SpreadingFactor, TxConfig};
@@ -36,9 +36,21 @@ pub struct SubGhzRadio<'a, RS> {
     irq: SUBGHZ_RADIO,
 }
 
+#[derive(Default)]
+#[non_exhaustive]
+pub struct SubGhzRadioConfig {
+    pub reg_mode: RegMode,
+    pub calibrate_image: CalibrateImage,
+}
+
 impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
     /// Create a new instance of a SubGhz radio for LoRaWAN.
-    pub fn new(mut radio: SubGhz<'a, NoDma, NoDma>, switch: RS, irq: impl Unborrow<Target = SUBGHZ_RADIO>) -> Self {
+    pub fn new(
+        mut radio: SubGhz<'a, NoDma, NoDma>,
+        switch: RS,
+        irq: impl Unborrow<Target = SUBGHZ_RADIO>,
+        config: SubGhzRadioConfig,
+    ) -> Result<Self, RadioError> {
         unborrow!(irq);
 
         radio.reset();
@@ -49,46 +61,17 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
             unsafe { SUBGHZ_RADIO::steal().disable() };
         });
 
-        Self { radio, switch, irq }
-    }
+        configure_radio(&mut radio, config)?;
 
-    /// Configure radio settings in preparation for TX or RX
-    pub(crate) fn configure(&mut self) -> Result<(), RadioError> {
-        trace!("Configuring STM32WL SUBGHZ radio");
-        self.radio.set_standby(StandbyClk::Rc)?;
-        let tcxo_mode = TcxoMode::new()
-            .set_txco_trim(TcxoTrim::Volts1pt7)
-            .set_timeout(Timeout::from_duration_sat(core::time::Duration::from_millis(40)));
-
-        self.radio.set_tcxo_mode(&tcxo_mode)?;
-        self.radio.set_regulator_mode(RegMode::Ldo)?;
-
-        self.radio.calibrate_image(CalibrateImage::ISM_863_870)?;
-
-        self.radio.set_buffer_base_address(0, 0)?;
-
-        self.radio
-            .set_pa_config(&PaConfig::new().set_pa_duty_cycle(0x1).set_hp_max(0x0).set_pa(PaSel::Lp))?;
-
-        self.radio.set_pa_ocp(Ocp::Max140m)?;
-
-        //        let tx_params = TxParams::LP_14.set_ramp_time(RampTime::Micros40);
-        self.radio
-            .set_tx_params(&TxParams::new().set_ramp_time(RampTime::Micros40).set_power(0x0A))?;
-
-        self.radio.set_packet_type(PacketType::LoRa)?;
-        self.radio.set_lora_sync_word(LoRaSyncWord::Public)?;
-        trace!("Done initializing STM32WL SUBGHZ radio");
-        Ok(())
+        Ok(Self { radio, switch, irq })
     }
 
     /// Perform a transmission with the given parameters and payload. Returns any time adjustements needed form
     /// the upcoming RX window start.
     async fn do_tx(&mut self, config: TxConfig, buf: &[u8]) -> Result<u32, RadioError> {
-        //trace!("TX Request: {}", config);
-        trace!("TX START");
+        trace!("TX Request: {}", config);
+        //trace!("TX START");
         self.switch.set_tx();
-        self.configure()?;
 
         self.radio
             .set_rf_frequency(&RfFreq::from_frequency(config.rf.frequency))?;
@@ -152,7 +135,6 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
         trace!("RX START");
         // trace!("Starting RX: {}", config);
         self.switch.set_rx();
-        self.configure()?;
 
         self.radio.set_rf_frequency(&RfFreq::from_frequency(config.frequency))?;
 
@@ -168,7 +150,7 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
 
         let irq_cfg = CfgIrq::new()
             .irq_enable_all(Irq::RxDone)
-            .irq_enable_all(Irq::PreambleDetected)
+            //.irq_enable_all(Irq::PreambleDetected)
             .irq_enable_all(Irq::HeaderErr)
             .irq_enable_all(Irq::Timeout)
             .irq_enable_all(Irq::Err);
@@ -221,6 +203,35 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
         })
         .await
     }
+}
+
+fn configure_radio(radio: &mut SubGhz<'_, NoDma, NoDma>, config: SubGhzRadioConfig) -> Result<(), RadioError> {
+    trace!("Configuring STM32WL SUBGHZ radio");
+
+    radio.set_regulator_mode(config.reg_mode)?;
+    radio.set_standby(StandbyClk::Rc)?;
+
+    let tcxo_mode = TcxoMode::new()
+        .set_txco_trim(TcxoTrim::Volts1pt7)
+        .set_timeout(Timeout::from_duration_sat(core::time::Duration::from_millis(100)));
+    radio.set_tcxo_mode(&tcxo_mode)?;
+    // Reduce input capacitance as shown in Reference Manual "Figure 23. HSE32 TCXO control".
+    // The STM32CUBE C driver also does this.
+    radio.set_hse_in_trim(HseTrim::MIN)?;
+
+    // Re-calibrate everything after setting the TXCO config.
+    radio.calibrate(0x7F)?;
+    radio.calibrate_image(config.calibrate_image)?;
+
+    radio.set_pa_config(&PaConfig::HP_14)?;
+    radio.set_tx_params(&TxParams::HP.set_ramp_time(RampTime::Micros40))?;
+    radio.set_pa_ocp(Ocp::Max140m)?;
+
+    radio.set_packet_type(PacketType::LoRa)?;
+    radio.set_lora_sync_word(LoRaSyncWord::Public)?;
+
+    trace!("Done initializing STM32WL SUBGHZ radio");
+    Ok(())
 }
 
 impl<RS: RadioSwitch> PhyRxTx for SubGhzRadio<'static, RS> {
