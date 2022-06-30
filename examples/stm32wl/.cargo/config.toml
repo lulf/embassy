@@ -2,8 +2,14 @@
 # replace your chip as listed in `probe-run --list-chips`
 runner = "probe-run --chip STM32WLE5JCIx"
 
+rustflags = [
+  # Code-size optimizations.
+  "-Z", "emit-stack-sizes",
+]
+
 [build]
 target = "thumbv7em-none-eabihf"
+
 
 [env]
 DEFMT_LOG = "trace"
