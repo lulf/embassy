@@ -293,6 +293,42 @@ impl<'d> embedded_io::asynch::Write for TcpSocket<'d> {
     }
 }
 
+#[cfg(feature = "unstable-traits")]
+impl<'d> embedded_nal_async::TcpClientSocket for TcpSocket<'d> {
+    type ConnectFuture<'m> = impl Future<Output = Result<(), Self::Error>> + 'm
+    where
+        Self: 'm;
+
+    fn connect<'m>(&'m mut self, remote: embedded_nal_async::SocketAddr) -> Self::ConnectFuture<'m> {
+        use embedded_nal_async::IpAddr;
+        use crate::IpAddress;
+        async move {
+            let addr: IpAddress = match remote.ip() {
+                IpAddr::V4(addr) => crate::IpAddress::Ipv4(crate::Ipv4Address::from_bytes(&addr.octets())),
+                #[cfg(feature = "proto-ipv6")]
+                IpAddr::V6(addr) => crate::IpAddress::Ipv6(crate::Ipv6Address::from_bytes(&addr.octets())),
+                #[cfg(not(feature = "proto-ipv6"))]
+                IpAddr::V6(_) => panic!("ipv6 support not enabled"),
+            };
+            let remote_endpoint = (addr, remote.port());
+            self.connect(remote_endpoint).await.map_err(|_| Error::ConnectionReset)?;
+            Ok(())
+        }
+    }
+
+    type IsConnectedFuture<'m> = impl Future<Output = Result<bool, Self::Error>> + 'm
+        where
+            Self: 'm;
+    fn is_connected<'m>(&'m mut self) -> Self::IsConnectedFuture<'m> {
+        async move { Ok(self.state() == tcp::State::Established) }
+    }
+
+    fn disconnect(&mut self) -> Result<(), Self::Error> {
+        self.close();
+        Ok(())
+    }
+}
+
 impl<'d> embedded_io::Io for TcpReader<'d> {
     type Error = Error;
 }
