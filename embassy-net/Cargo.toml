@@ -48,7 +48,8 @@ generic-array       = { version = "0.14.4", default-features = false }
 stable_deref_trait  = { version = "1.2.0", default-features = false }
 futures             = { version = "0.3.17", default-features = false, features = [ "async-await" ] }
 atomic-pool = "0.2.1"
-embedded-nal-async  = { version = "0.1.0", default-features = false, git = "https://github.com/lulf/embedded-nal.git", rev = "98e43c624c053aae3b4547998b83ddf4775d4d45", optional = true }
+#embedded-nal-async  = { version = "0.1.0", default-features = false, git = "https://github.com/lulf/embedded-nal.git", rev = "98e43c624c053aae3b4547998b83ddf4775d4d45", optional = true }
+embedded-nal-async  = { version = "0.1.0", default-features = false, path = "../../embedded-nal/embedded-nal-async", optional = true }
 
 [dependencies.smoltcp]
 version = "0.8.0"
