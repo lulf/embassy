@@ -383,8 +383,8 @@ impl<'d, D: Device, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embe
 
 #[cfg(feature = "unstable-traits")]
 impl<'d, D: Device, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_nal_async::TcpConnector for TcpClient<'d, D, N, TX_SZ, RX_SZ> {
-    type TcpConnection<'m> = TcpConnection<'m, N, TX_SZ, RX_SZ> where Self: 'm;
-    type ConnectFuture<'m> = impl Future<Output = Result<Self::TcpConnection<'m>, Self::Error>> + 'm
+    type Connection<'m> = TcpConnection<'m, N, TX_SZ, RX_SZ> where Self: 'm;
+    type ConnectFuture<'m> = impl Future<Output = Result<Self::Connection<'m>, Self::Error>> + 'm
     where
         Self: 'm;
 
