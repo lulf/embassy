@@ -86,9 +86,11 @@ async fn main(_spawner: embassy::executor::Spawner, p: Peripherals) {
     // TODO: Adjust the EUI and Keys according to your network credentials
     device
         .join(&JoinMode::OTAA {
-            deveui: [0, 0, 0, 0, 0, 0, 0, 0],
+            deveui: [0x02, 0x6B, 0x08, 0x3E, 0x61, 0x1B, 0xD7, 0x72],
             appeui: [0, 0, 0, 0, 0, 0, 0, 0],
-            appkey: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            appkey: [
+                0xA9, 0x35, 0xCC, 0x58, 0xC4, 0xD9, 0x9A, 0x99, 0xF5, 0x95, 0x94, 0xF3, 0x8F, 0x3E, 0x37, 0xD5,
+            ],
         })
         .await
         .ok()
