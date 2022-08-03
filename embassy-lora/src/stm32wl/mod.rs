@@ -32,6 +32,7 @@ static IRQ_WAKER: AtomicWaker = AtomicWaker::new();
 /// The radio peripheral keeping the radio state and owning the radio IRQ.
 pub struct SubGhzRadio<'a, RS> {
     radio: SubGhz<'a, NoDma, NoDma>,
+    config: SubGhzRadioConfig,
     switch: RS,
     irq: SUBGHZ_RADIO,
 }
@@ -61,14 +62,15 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
             unsafe { SUBGHZ_RADIO::steal().disable() };
         });
 
-        configure_radio(&mut radio, config)?;
+        configure_radio(&mut radio, &config)?;
 
-        Ok(Self { radio, switch, irq })
+        Ok(Self { radio, switch, irq, config })
     }
 
     /// Perform a transmission with the given parameters and payload. Returns any time adjustements needed form
     /// the upcoming RX window start.
     async fn do_tx(&mut self, config: TxConfig, buf: &[u8]) -> Result<u32, RadioError> {
+        configure_radio(&mut self.radio, &self.config)?;
         trace!("TX request: {}", config);
         self.switch.set_tx();
 
@@ -130,6 +132,7 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
     async fn do_rx(&mut self, config: RfConfig, buf: &mut [u8]) -> Result<(usize, RxQuality), RadioError> {
         assert!(buf.len() >= 255);
         trace!("RX request: {}", config);
+        configure_radio(&mut self.radio, &self.config)?;
         self.switch.set_rx();
 
         self.radio.set_rf_frequency(&RfFreq::from_frequency(config.frequency))?;
@@ -140,7 +143,7 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
             .set_preamble_len(8)
             .set_header_type(HeaderType::Variable)
             .set_payload_len(0xFF)
-            .set_crc_en(false)
+            .set_crc_en(true)
             .set_invert_iq(true);
         self.radio.set_lora_packet_params(&packet_params)?;
 
@@ -162,6 +165,10 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
         loop {
             let (_status, irq_status) = self.irq_wait().await;
 
+            if irq_status & Irq::Timeout.mask() != 0 {
+                return Err(RadioError);
+            }
+
             if irq_status & Irq::RxDone.mask() != 0 {
                 let (_status, len, ptr) = self.radio.rx_buffer_status()?;
                 let packet_status = self.radio.lora_packet_status()?;
@@ -174,9 +181,6 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
                 return Ok((len as usize, RxQuality::new(rssi, snr as i8)));
             }
 
-            if irq_status & Irq::Timeout.mask() != 0 {
-                return Err(RadioError);
-            }
         }
     }
 
@@ -203,7 +207,7 @@ impl<'a, RS: RadioSwitch> SubGhzRadio<'a, RS> {
     }
 }
 
-fn configure_radio(radio: &mut SubGhz<'_, NoDma, NoDma>, config: SubGhzRadioConfig) -> Result<(), RadioError> {
+fn configure_radio(radio: &mut SubGhz<'_, NoDma, NoDma>, config: &SubGhzRadioConfig) -> Result<(), RadioError> {
     trace!("Configuring STM32WL SUBGHZ radio");
 
     radio.set_regulator_mode(config.reg_mode)?;

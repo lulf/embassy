@@ -65,12 +65,12 @@ async fn main(_spawner: embassy::executor::Spawner, p: Peripherals) {
     radio_config.calibrate_image = CalibrateImage::ISM_863_870;
     let radio = SubGhzRadio::new(radio, rfs, irq, radio_config).unwrap();
 
-    let mut region: region::Configuration = region::EU868::default().into();
+    let region: region::Configuration = region::EU868::default().into();
 
     // NOTE: This is specific for TTN, as they have a special RX1 delay
-    region.set_receive_delay1(5000);
+    //    region.set_receive_delay1(5000);
 
-    let mut device: Device<_, Crypto, _, _> = Device::new(region, radio, LoraTimer, Rng::new(p.RNG));
+    let mut device: Device<_, Crypto, _, _> = Device::new(region, radio, LoraTimer::new(), Rng::new(p.RNG));
 
     // Depending on network, this might be part of JOIN
     device.set_datarate(region::DR::_0); // SF12
