@@ -377,12 +377,8 @@ impl From<Error> for ClientError {
 }
 
 #[cfg(feature = "unstable-traits")]
-impl<'d, D: Device, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io::Io for TcpClient<'d, D, N, TX_SZ, RX_SZ> {
-    type Error = ClientError;
-}
-
-#[cfg(feature = "unstable-traits")]
-impl<'d, D: Device, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_nal_async::TcpConnector for TcpClient<'d, D, N, TX_SZ, RX_SZ> {
+impl<'d, D: Device, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_nal_async::TcpConnect for TcpClient<'d, D, N, TX_SZ, RX_SZ> {
+    type Error = Error;
     type Connection<'m> = TcpConnection<'m, N, TX_SZ, RX_SZ> where Self: 'm;
     type ConnectFuture<'m> = impl Future<Output = Result<Self::Connection<'m>, Self::Error>> + 'm
     where
@@ -416,9 +412,9 @@ pub struct TcpConnection<'d, const N: usize, const TX_SZ: usize, const RX_SZ: us
 }
 
 impl<'d, const N: usize, const TX_SZ: usize, const RX_SZ: usize> TcpConnection<'d, N, TX_SZ, RX_SZ> {
-    pub fn new<D: Device>(stack: &'d Stack<D>, tx: &'d Pool<[u8; TX_SZ], N>, rx: &'d Pool<[u8; RX_SZ], N>) -> Result<Self, ClientError> {
-        let mut txb = tx.alloc().ok_or(ClientError::OutOfMemory)?;
-        let mut rxb = rx.alloc().ok_or(ClientError::OutOfMemory)?;
+    pub fn new<D: Device>(stack: &'d Stack<D>, tx: &'d Pool<[u8; TX_SZ], N>, rx: &'d Pool<[u8; RX_SZ], N>) -> Result<Self, Error> {
+        let mut txb = tx.alloc().ok_or(Error::ConnectionReset)?;
+        let mut rxb = rx.alloc().ok_or(Error::ConnectionReset)?;
         Ok(Self {
             socket: unsafe { TcpSocket::new(stack, rxb.as_mut(), txb.as_mut()) },
             tx,
