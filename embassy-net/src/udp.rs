@@ -4,6 +4,7 @@ use core::mem;
 use core::task::Poll;
 
 use embassy_net_driver::Driver;
+use embedded_io::ErrorKind;
 use smoltcp::iface::{Interface, SocketHandle};
 use smoltcp::socket::udp::{self, PacketMetadata};
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
@@ -19,11 +20,23 @@ pub enum BindError {
     NoRoute,
 }
 
+impl embedded_io::Error for BindError {
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
     /// No route to host.
     NoRoute,
+}
+
+impl embedded_io::Error for Error {
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
 }
 
 pub struct UdpSocket<'a> {
@@ -146,5 +159,68 @@ impl<'a> UdpSocket<'a> {
 impl Drop for UdpSocket<'_> {
     fn drop(&mut self) {
         self.stack.borrow_mut().sockets.remove(self.handle);
+    }
+}
+
+#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
+pub mod client {
+    use core::cell::UnsafeCell;
+    use core::mem::MaybeUninit;
+    use core::ptr::NonNull;
+
+    use atomic_polyfill::{AtomicBool, Ordering};
+    use embedded_nal_async::{ConnectedUdp, IpAddr, SocketAddr, UnconnectedUdp};
+
+    use super::*;
+
+    pub struct UdpStack<'d, D: Driver> {
+        stack: &'d Stack<D>,
+    }
+
+    impl<'a, D> embedded_nal_async::UdpStack for UdpStack<'a, D>
+    where
+        D: Driver,
+    {
+        type Error = Error;
+
+        type Connected = UdpSocket<'a>;
+        type UniquelyBound = UdpSocket<'a>;
+        type MultiplyBound = UdpSocket<'a>;
+
+        async fn connect_from(
+            &self,
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> Result<(SocketAddr, Self::Connected), Self::Error> {
+            todo!()
+        }
+
+        async fn bind_single(&self, _: SocketAddr) -> Result<(SocketAddr, Self::UniquelyBound), Self::Error> {
+            todo!()
+        }
+        async fn bind_multiple(&self, _: SocketAddr) -> Result<Self::MultiplyBound, Self::Error> {
+            todo!()
+        }
+    }
+
+    impl<'a> ConnectedUdp for UdpSocket<'a> {
+        type Error = Error;
+
+        async fn send(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            todo!()
+        }
+        async fn receive_into(&mut self, _: &mut [u8]) -> Result<usize, Self::Error> {
+            todo!()
+        }
+    }
+
+    impl<'a> UnconnectedUdp for UdpSocket<'a> {
+        type Error = Error;
+        async fn send(&mut self, _: SocketAddr, _: SocketAddr, _: &[u8]) -> Result<(), Self::Error> {
+            todo!()
+        }
+        async fn receive_into(&mut self, _: &mut [u8]) -> Result<(usize, SocketAddr, SocketAddr), Self::Error> {
+            todo!()
+        }
     }
 }
